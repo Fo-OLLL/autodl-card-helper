@@ -5,7 +5,7 @@
 ## 安装和使用
 
 1. 在 Chrome / Edge 安装 Tampermonkey，确保扩展允许用户脚本运行。
-2. 打开 [安装 / 更新脚本](https://raw.githubusercontent.com/Fo-OLLL/autodl-card-helper/main/autodl-helper.user.js)，在 Tampermonkey 中安装或更新。也可新建脚本，粘贴 [`autodl-helper.user.js`](./autodl-helper.user.js) 全文并保存。
+2. 打开 [安装 / 更新脚本](https://raw.githubusercontent.com/Fo-OLLL/autodl-card-helper/main/autodl-helper.user.js)，在 Tampermonkey 中安装或更新。
 3. 登录 `https://www.autodl.com`，打开控制台或算力市场，点击右下角 **AutoDL 抢卡**。
 4. 在“设置”调整全局检查间隔，默认 10 秒、最低 5 秒；点击“测试提醒”解锁声音、检查桌面通知。
 5. 选择“抢开机”或“抢新实例”，配置后点击启动。点击启动即授权脚本自动执行所选实例关机、GPU 开机或新实例创建，并产生网站正常计费。
@@ -99,10 +99,7 @@ Server酱为可选功能：
 
 ## 参考资料
 
-实现重新编写，以下项目用于理解流程和对照接口；未直接复制其源码：
-
-- [Jiayi-Fu/autodl-gpu-monitor](https://github.com/Jiayi-Fu/autodl-gpu-monitor)：普通实例库存查询、自动创建、Server酱通知。
-- [wangzhao-desgin/autodl-gpu-monitor](https://github.com/wangzhao-desgin/autodl-gpu-monitor)：网页会话、无卡模式关机再开机的流程。
+以下项目用于理解流程和对照接口；：
 - [AutoDL 官方快速开始](https://www.autodl.com/docs/quick_start/)：按地区、型号、数量和镜像创建实例。
 - [AutoDL 官方数据盘说明](https://www.autodl.com/docs/local_disk/)：基础盘与额外扩容的区别。
 - [AutoDL 官方无卡模式说明](https://www.autodl.com/docs/save_money/)。
