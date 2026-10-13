@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoDL 抢卡助手
 // @namespace    autodl-card-helper
-// @version      0.2.1
+// @version      0.2.2
 // @homepageURL  https://github.com/Fo-OLLL/autodl-card-helper
 // @supportURL   https://github.com/Fo-OLLL/autodl-card-helper/issues
 // @updateURL    https://raw.githubusercontent.com/Fo-OLLL/autodl-card-helper/main/autodl-helper.user.js
@@ -65,6 +65,15 @@
     const names = new Set(rows.flatMap(row => Object.keys(row)));
     return catalog.filter(g => names.has(g.gpu_name) && g.chip_corp !== 'cpu')
       .map(g => ({ ...g, id: g.gpu_name, name: g.gpu_name }));
+  }
+  function availableDrivers(rows) {
+    return [...new Set(rows.map(r => String(r.driver_version || '').trim()).filter(v => compareVersion(v, '0') !== null))]
+      .sort((a, b) => compareVersion(b, a));
+  }
+  function instanceDisplay(row) {
+    return { gpu: row.snapshot_gpu_alias_name || row.gpu_name || '型号未知',
+      status: row.status, tone: row.status === 'running' ? 'running' : shutdownStates.has(row.status) ? 'shutdown' : 'pending',
+      mode: row.start_mode === 'non_gpu' ? '无卡模式' : '', count: row.req_gpu_amount || '?' };
   }
   function matchesMachine(m, c) {
     if (!c.gpus.includes(m.gpu_name) || Number(m.gpu_idle_num) < c.gpuCount) return false;
@@ -147,8 +156,8 @@
       }
     }
     instances(account) { return this.pages('/api/v1/instance', { status: [], charge_type: [], name: '', sub_name: '' }, account); }
-    machines(c, account) { return this.pages('/api/v1/user/machine/list', {
-      charge_type: 'payg', gpu_type_name: c.gpus, gpu_idle_num: c.gpuCount,
+    machines(c, account, includeBusy = false) { return this.pages('/api/v1/user/machine/list', {
+      charge_type: 'payg', gpu_type_name: c.gpus, gpu_idle_num: includeBusy ? 0 : c.gpuCount,
       region_sign_list: c.regions.flatMap(r => r.signs), default_order: true,
       machine_tag_name: [], mount_net_disk: false, cpu_arch: [], chip_corp: [],
       instance_disk_size_order: '', date_range: '', date_from: '', date_to: '', pay_price_order: '', gpu_idle_type: ''
@@ -264,14 +273,14 @@
     if (!c.gpus?.length || !c.regions?.length || !c.image?.uuid) throw new Error('请选择 GPU、地区和镜像');
     if (!Number.isInteger(c.gpuCount) || c.gpuCount < 1) throw new Error('GPU 数量必须为正整数');
     if (![c.minExpandGb, c.expandGb].every(x => Number.isInteger(x) && x >= 0)) throw new Error('磁盘容量必须为非负整数');
-    if (c.driver.mode === 'minimum' && compareVersion(c.driver.value, '0') === null) throw new Error('请输入有效的最低驱动版本');
-    if (c.driver.mode === 'exact' && !c.driver.value.split(/[,，\s]+/).filter(Boolean).length) throw new Error('请输入指定驱动版本');
+    if (c.driver.mode === 'minimum' && compareVersion(c.driver.value, '0') === null) throw new Error('请读取并选择最低驱动版本');
+    if (c.driver.mode === 'exact' && !c.driver.value.split(/[,，\s]+/).filter(Boolean).length) throw new Error('请读取并选择指定驱动版本');
     if (c.driver.mode === 'exact' && c.driver.value.split(/[,，\s]+/).filter(Boolean).some(v => compareVersion(v, '0') === null)) throw new Error('驱动版本请用数字和点，多版本用逗号分隔');
   }
   // 无需构建即可在 Node 中测试业务逻辑；浏览器执行从此处开始。
   if (typeof module === 'object' && module.exports) {
     module.exports = { Api, ApiError, Engine, fresh, compareVersion, matchesMachine, sortMachines, createPayload,
-      groupRegions, regionalGpuOptions, flattenImages, isGpuRunning, serverChanUrl, validateNew }; return;
+      groupRegions, regionalGpuOptions, availableDrivers, instanceDisplay, flattenImages, isGpuRunning, serverChanUrl, validateNew }; return;
   }
   if (window.top !== window.self || document.getElementById('autodl-helper-host')) return;
   function session() {
@@ -403,6 +412,7 @@
     .section .picks{margin:10px 0}.section label:last-child{margin-bottom:0}.section .grid label{margin:6px 0}.section fieldset{border:0;padding:0;margin:0;min-width:0}.section fieldset:disabled{opacity:.6}.section .ordered{background:#fff;border-radius:7px;padding:4px 7px}.section .ordered button{padding:2px 8px}
     .section-title + .muted{margin:0 0 10px}.section-footer{border-top:1px solid #e1e8f2;padding-top:12px;margin-top:12px}.section-footer button{width:100%;padding:9px}.picker-title{color:#4d5f7a;font-size:12px}
     @media(max-width:520px){.grid{grid-template-columns:1fr;gap:0}.panel{right:12px;padding:14px}.top{top:-14px;margin:-14px -14px 10px;padding:14px 14px 0}}
+    .instance-option{background:#fff;border:1px solid #e1e8f2;border-radius:9px;padding:10px;gap:4px}.instance-detail{display:flex;flex-direction:column;gap:3px;min-width:0}.instance-meta{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12px}.state-badge{border-radius:5px;padding:1px 7px;background:#edf1f6;color:#61728c}.state-running{background:#e5f6eb;color:#18723b}.state-shutdown{background:#fdebed;color:#b32939}.driver-choices{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0}
   `);
   const panel = el('section', { class: 'panel', hidden: true });
   const launcher = button('AutoDL 抢卡', () => { panel.hidden = !panel.hidden; renderTasks(); }, 'launcher primary');
@@ -470,7 +480,11 @@
     const rows = await api.instances(session().account); instanceList.replaceChildren(); selectedInstances.clear();
     for (const r of rows) {
       const cb = input('checkbox', '', { onchange: () => cb.checked ? selectedInstances.set(r.uuid, r) : selectedInstances.delete(r.uuid) });
-      instanceList.append(el('label', { class: 'check' }, cb, el('span', {}, `${r.name || r.uuid} · ${r.status} / ${r.start_mode || '-'} · ${r.req_gpu_amount || '?'} 卡`)));
+      const display = instanceDisplay(r);
+      instanceList.append(el('label', { class: 'check instance-option' }, cb, el('span', { class: 'instance-detail' },
+        el('strong', {}, r.name || r.uuid), el('span', { class: 'instance-meta' },
+          el('span', { class: `state-badge state-${display.tone}` }, display.status),
+          el('span', {}, `${display.gpu} · ${display.count} 卡`), display.mode ? el('span', { class: 'muted' }, display.mode) : null))));
     }
     if (!rows.length) instanceList.append(el('p', {}, '当前账号没有普通容器实例'));
   }
@@ -510,7 +524,7 @@
       } };
   }
   const gpuPicker = orderedPicker('可选 GPU 型号 · 多选，↑↓调整优先级', () => {
-    resetImages('GPU 已更改，请重新读取镜像'); refreshNewForm();
+    resetImages('GPU 已更改，请重新读取镜像'); resetDrivers(); refreshNewForm();
   });
   const regionPicker = orderedPicker('可选地区 · 多选，↑↓调整地区优先级', () => {
     gpuQueryGeneration++; gpuPicker.setOptions([]);
@@ -522,7 +536,43 @@
   const minExpand = input('number', 0, { min: 0, step: 1 });
   const expand = input('number', 0, { min: 0, step: 1 });
   const driverMode = el('select', {}, el('option', { value: 'any' }, '不限制'), el('option', { value: 'minimum' }, '最低版本'), el('option', { value: 'exact' }, '指定版本'));
-  const driverValue = input('text', '', { placeholder: '550.54.15；多版本用逗号分隔' });
+  const driverValue = el('select', {}, el('option', { value: '' }, '先读取已有驱动版本'));
+  const driverExact = el('div', { class: 'driver-choices', hidden: true });
+  const driverHint = el('p', { class: 'muted' }, '选择 GPU 后读取已有驱动版本。');
+  let driverVersions = [], driverQueryGeneration = 0;
+  const exactVersions = new Set();
+  function renderDriverOptions() {
+    driverExact.replaceChildren(...driverVersions.map(v => {
+      const cb = input('checkbox', '', { checked: exactVersions.has(v), onchange: () => {
+        if (cb.checked) exactVersions.add(v); else exactVersions.delete(v);
+      } });
+      return el('label', { class: 'check' }, cb, v);
+    }));
+  }
+  function resetDrivers() {
+    driverQueryGeneration++; driverVersions = []; exactVersions.clear();
+    driverValue.replaceChildren(el('option', { value: '' }, '先读取已有驱动版本')); renderDriverOptions();
+    driverHint.textContent = '地区或 GPU 已更改，请重新读取已有驱动版本。';
+  }
+  async function loadDrivers() {
+    const gpus = gpuPicker.get(); if (!gpus.length) throw new Error('先选择 GPU 型号');
+    const generation = ++driverQueryGeneration, account = session().account;
+    readDriversButton.disabled = true; driverHint.textContent = '正在读取主机显卡驱动…';
+    try {
+      const c = { gpus: gpus.map(g => g.name), regions: regionPicker.get(), gpuCount: 1 };
+      const rows = await api.machines(c, account, true);
+      if (generation !== driverQueryGeneration || account !== session().account) return;
+      driverVersions = availableDrivers(rows.filter(r => c.gpus.includes(r.gpu_name) && c.regions.some(region => region.signs.includes(r.region_sign))));
+      exactVersions.clear();
+      driverValue.replaceChildren(el('option', { value: '' }, driverVersions.length ? '请选择最低驱动版本' : '没有可用的驱动版本'),
+        ...driverVersions.map(v => el('option', { value: v }, v)));
+      renderDriverOptions();
+      driverHint.textContent = driverVersions.length ? `读取到 ${driverVersions.length} 个已有版本，包含当前无空闲卡主机的驱动。指定版本可多选。` : '未读到有效驱动版本，可保持“不限制”或稍后重试。';
+    } catch (error) {
+      if (generation !== driverQueryGeneration || account !== session().account) return;
+      driverHint.textContent = '驱动读取失败，请重试。'; throw error;
+    } finally { if (generation === driverQueryGeneration) refreshNewForm(); }
+  }
   const imageType = el('select', {}, el('option', { value: 'base' }, '官方基础镜像'), el('option', { value: 'private' }, '我的私有镜像'));
   const imageSelect = el('select', {}, el('option', { value: '' }, '先选 GPU，再读取镜像'));
   let images = [], imageQueryGeneration = 0, gpuQueryGeneration = 0;
@@ -574,8 +624,10 @@
       ...images.map(i => el('option', { value: i.uuid }, i.name)));
     refreshNewForm();
   }
+  const readDriversButton = button('读取已有显卡驱动', safeAction(loadDrivers));
+  const minimumDriverField = label('最低驱动版本', driverValue);
   const filtersFields = el('fieldset', {}, label('每个实例 GPU 数量', gpuCount),
-    el('div', { class: 'grid' }, label('显卡驱动筛选', driverMode), label('驱动版本', driverValue)),
+    label('显卡驱动筛选', driverMode), readDriversButton, driverHint, minimumDriverField, driverExact,
     el('div', { class: 'grid' }, label('主机可扩容容量至少（GB）', minExpand), label('实际额外扩容（GB，0 使用基础盘）', expand)));
   const readGpusButton = button('读取所选地区的 GPU', safeAction(loadRegionGpus));
   const readImagesButton = button('读取可用镜像', safeAction(loadImages));
@@ -585,7 +637,7 @@
       const selectedGpus = gpuPicker.get();
       if (image && selectedGpus.some(g => g.chip_corp !== image.chip_corp || g.cpu_arch !== image.cpu_arch)) throw new Error('GPU 架构已更改，请重新读取镜像');
       const c = { gpus: selectedGpus.map(g => g.name), regions: regionPicker.get(), gpuCount: Number(gpuCount.value),
-        driver: { mode: driverMode.value, value: driverValue.value.trim() }, minExpandGb: Number(minExpand.value), expandGb: Number(expand.value), image };
+        driver: { mode: driverMode.value, value: driverMode.value === 'minimum' ? driverValue.value : driverMode.value === 'exact' ? [...exactVersions].join(',') : '' }, minExpandGb: Number(minExpand.value), expandGb: Number(expand.value), image };
       validateNew(c);
       const account = session().account; if (!account) throw new Error('请先登录 AutoDL');
       const id = uid();
@@ -597,7 +649,9 @@
     const hasGpu = gpuPicker.get().length > 0;
     readGpusButton.disabled = !regionPicker.get().length;
     filtersFields.disabled = !hasGpu; imageFields.disabled = !hasGpu;
-    driverValue.disabled = driverMode.value === 'any';
+    readDriversButton.disabled = !hasGpu;
+    minimumDriverField.hidden = driverMode.value !== 'minimum'; driverExact.hidden = driverMode.value !== 'exact';
+    driverValue.disabled = driverMode.value !== 'minimum' || !driverVersions.length;
     startNewButton.disabled = !hasGpu || !imageSelect.value;
   }
   driverMode.addEventListener('change', refreshNewForm);

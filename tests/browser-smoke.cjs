@@ -13,7 +13,8 @@ const { fresh } = require('../autodl-helper.user.js');
   try {
     const context = await browser.newContext({ viewport: { width: 1280, height: 1000 } });
     const errors = [], calls = [], notifications = [];
-    let rows = [{ uuid: 'existing-1', name: '我的无卡实例', status: 'running', start_mode: 'non_gpu', req_gpu_amount: 1 }];
+    let rows = [{ uuid: 'existing-1', name: '我的无卡实例', snapshot_gpu_alias_name: 'RTX 4090D', status: 'running', start_mode: 'non_gpu', req_gpu_amount: 1 },
+      { uuid: 'shutdown-2', name: '已关机实例', snapshot_gpu_alias_name: 'A100-SXM4-80GB', status: 'shutdown', start_mode: 'gpu', req_gpu_amount: 2 }];
     let createCount = 0;
     await context.exposeFunction('recordNotification', data => notifications.push(data));
     await context.addInitScript(() => {
@@ -52,7 +53,8 @@ const { fresh } = require('../autodl-helper.user.js');
         case '/api/v1/image/private/get': data = [{ image_uuid: 'private-1', name: '我的训练环境', cuda_v: '12.4', chip_corp: 'nvidia', cpu_arch: 'x86' }]; break;
         case '/api/v1/user/machine/list': data = { list: [{ machine_id: 'machine1', gpu_name: 'RTX 4090D', gpu_idle_num: 4,
           region_sign: 'west1', region_name: '西北', on_line: 1, driver_version: '570.10', max_data_disk_expand_size: 1024 ** 4,
-          chip_corp: 'nvidia', cpu_arch: 'x86', highest_cuda_version: '12.8' }], result_total: 1, page_size: 90 }; break;
+          chip_corp: 'nvidia', cpu_arch: 'x86', highest_cuda_version: '12.8' }], result_total: 1, page_size: 90 };
+          if (body.gpu_idle_num === 0) { data.list.push({ ...data.list[0], machine_id: 'busy', gpu_idle_num: 0, driver_version: '550.54.15' }); data.result_total = 2; } break;
         case '/api/v1/order/instance/create/payg':
           data = `created-${++createCount}`;
           rows.push({ uuid: data, name: body.instance_info.instance_name, status: 'running', start_mode: 'gpu', req_gpu_amount: body.instance_info.req_gpu_amount }); break;
@@ -70,6 +72,12 @@ const { fresh } = require('../autodl-helper.user.js');
     await host.locator('button.launcher').click();
     await host.getByRole('button', { name: '抢开机', exact: true }).click();
     await host.getByRole('button', { name: '读取我的实例', exact: true }).click();
+    await host.getByLabel(/我的无卡实例/).waitFor();
+    assert.match(await host.getByLabel(/我的无卡实例/).locator('..').innerText(), /RTX 4090D/);
+    assert.equal(await host.locator('.state-running').count(), 1);
+    assert.equal(await host.locator('.state-shutdown').count(), 1);
+    fs.mkdirSync(path.join(__dirname, '../.research'), { recursive: true });
+    await page.screenshot({ path: path.join(__dirname, '../.research/ui-instances.png') });
     await host.getByLabel(/我的无卡实例/).check();
     await host.getByRole('button', { name: '启动所选实例抢卡' }).click();
     const advance = async n => { await page.clock.fastForward(n); await page.waitForTimeout(100); };
@@ -98,6 +106,16 @@ const { fresh } = require('../autodl-helper.user.js');
     await host.getByRole('button', { name: 'RTX 4090', exact: true }).click();
     assert.equal(await host.getByRole('button', { name: 'RTX 5090', exact: true }).count(), 0);
     assert.deepEqual(calls.filter(c => c[0].endsWith('region/gpu_type')).map(c => c[1].region_sign_list), [['bj1'], ['bj1', 'west1']]);
+    await host.getByRole('button', { name: '读取已有显卡驱动', exact: true }).click();
+    await host.getByLabel('显卡驱动筛选', { exact: true }).selectOption('minimum');
+    await host.getByLabel('最低驱动版本', { exact: true }).selectOption('550.54.15');
+    assert.equal(await host.getByLabel('最低驱动版本', { exact: true }).evaluate(n => n.tagName), 'SELECT');
+    assert.equal(calls.filter(c => c[0].endsWith('user/machine/list')).at(-1)[1].gpu_idle_num, 0);
+    await host.getByLabel('显卡驱动筛选', { exact: true }).selectOption('exact');
+    await host.getByLabel('570.10', { exact: true }).check();
+    await host.getByLabel('550.54.15', { exact: true }).check();
+    await host.getByLabel('显卡驱动筛选', { exact: true }).scrollIntoViewIfNeeded();
+    await page.screenshot({ path: path.join(__dirname, '../.research/ui-drivers.png') });
     await host.getByLabel('任务名称', { exact: true }).fill('训练任务 A');
     await host.getByLabel('每个实例 GPU 数量').fill('2');
     await host.getByLabel('主机可扩容容量至少（GB）').fill('500');
@@ -106,11 +124,15 @@ const { fresh } = require('../autodl-helper.user.js');
     // 已选镜像也必须在更改地区后失效，不能误用旧配置。
     await host.getByRole('button', { name: '北京', exact: true }).click();
     assert.equal(await host.getByLabel('使用的镜像', { exact: true }).inputValue(), '');
+    assert.equal(await host.getByLabel('570.10', { exact: true }).count(), 0);
     assert.equal(await host.getByRole('button', { name: '添加并启动新实例任务', exact: true }).isDisabled(), true);
     await host.getByRole('button', { name: '北京', exact: true }).click();
     await host.getByRole('button', { name: '读取所选地区的 GPU', exact: true }).click();
     await host.getByRole('button', { name: 'RTX 4090D', exact: true }).click();
     await host.getByRole('button', { name: 'RTX 4090', exact: true }).click();
+    await host.getByRole('button', { name: '读取已有显卡驱动', exact: true }).click();
+    await host.getByLabel('570.10', { exact: true }).check();
+    await host.getByLabel('550.54.15', { exact: true }).check();
     await host.getByRole('button', { name: '读取可用镜像', exact: true }).click();
     await host.getByLabel('使用的镜像', { exact: true }).selectOption('base-1');
     fs.mkdirSync(path.join(__dirname, '../.research'), { recursive: true });
@@ -119,6 +141,10 @@ const { fresh } = require('../autodl-helper.user.js');
     await host.getByLabel('使用的镜像', { exact: true }).scrollIntoViewIfNeeded();
     await page.screenshot({ path: path.join(__dirname, '../.research/ui-new.png') });
     await host.getByRole('button', { name: '添加并启动新实例任务', exact: true }).click();
+    await page.waitForFunction(() => JSON.parse(localStorage.getItem('mock-gm-autodl-helper-v1')).tasks.some(t => t.kind === 'new'));
+    const saved = await page.evaluate(() => JSON.parse(localStorage.getItem('mock-gm-autodl-helper-v1')).tasks.find(t => t.kind === 'new'));
+    assert.equal(saved.config.driver.mode, 'exact');
+    assert.deepEqual(saved.config.driver.value.split(','), ['570.10', '550.54.15']);
 
     // 第二个任务使用私有镜像，两个任务都应各创建一个。
     await host.getByRole('button', { name: '抢新实例', exact: true }).click();

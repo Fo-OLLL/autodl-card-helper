@@ -2,7 +2,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { Api, ApiError, Engine, fresh, compareVersion, sortMachines, createPayload, groupRegions,
-  flattenImages, regionalGpuOptions, isGpuRunning, serverChanUrl, validateNew } = require('../autodl-helper.user.js');
+  flattenImages, regionalGpuOptions, availableDrivers, instanceDisplay, isGpuRunning, serverChanUrl, validateNew } = require('../autodl-helper.user.js');
 const copy = x => JSON.parse(JSON.stringify(x));
 const GB = 1024 ** 3;
 const config = () => ({ gpus: ['RTX 4090D', 'RTX 4090'], regions: [{ name: '北京', signs: ['bj'] }, { name: '西北', signs: ['west'] }],
@@ -81,6 +81,16 @@ test('地区 GPU 仅展示当地型号，保留零空闲型号并合并架构信
   assert.equal(result[0].chip_corp, 'nvidia');
   assert.deepEqual(regionalGpuOptions([], catalog), []);
   assert.throws(() => regionalGpuOptions({}, catalog));
+});
+test('驱动选项去重、忽略无效字段，按数值而非字符串排序', () => {
+  assert.deepEqual(availableDrivers(['550.9', '550.10', '570.10', '550.9', '', 'unknown'].map(driver_version => ({ driver_version }))), ['570.10', '550.10', '550.9']);
+});
+test('实例展示显卡快照型号，运行/关机颜色区分，无卡模式保留型号', () => {
+  const d = instanceDisplay({ snapshot_gpu_alias_name: 'RTX 4090D', start_mode: 'non_gpu', status: 'running', req_gpu_amount: 2 });
+  assert.equal(d.gpu, 'RTX 4090D'); assert.equal(d.tone, 'running'); assert.equal(d.mode, '无卡模式');
+  assert.equal(instanceDisplay({ status: 'shutdown' }).tone, 'shutdown');
+  assert.equal(instanceDisplay({ status: 'shutdown_by_starting_error' }).tone, 'shutdown');
+  assert.equal(instanceDisplay({ status: 'starting' }).tone, 'pending');
 });
 test('已选择多个实例全部完成，单个成功不终止其他任务', async () => {
   const f = fixture([existing('a'), existing('b')], { instances: async () => [
