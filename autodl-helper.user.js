@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoDL 抢卡助手
 // @namespace    autodl-card-helper
-// @version      0.2.2
+// @version      0.2.3
 // @homepageURL  https://github.com/Fo-OLLL/autodl-card-helper
 // @supportURL   https://github.com/Fo-OLLL/autodl-card-helper/issues
 // @updateURL    https://raw.githubusercontent.com/Fo-OLLL/autodl-card-helper/main/autodl-helper.user.js
@@ -273,8 +273,8 @@
     if (!c.gpus?.length || !c.regions?.length || !c.image?.uuid) throw new Error('请选择 GPU、地区和镜像');
     if (!Number.isInteger(c.gpuCount) || c.gpuCount < 1) throw new Error('GPU 数量必须为正整数');
     if (![c.minExpandGb, c.expandGb].every(x => Number.isInteger(x) && x >= 0)) throw new Error('磁盘容量必须为非负整数');
-    if (c.driver.mode === 'minimum' && compareVersion(c.driver.value, '0') === null) throw new Error('请读取并选择最低驱动版本');
-    if (c.driver.mode === 'exact' && !c.driver.value.split(/[,，\s]+/).filter(Boolean).length) throw new Error('请读取并选择指定驱动版本');
+    if (c.driver.mode === 'minimum' && compareVersion(c.driver.value, '0') === null) throw new Error('请等待驱动加载完成并选择最低版本');
+    if (c.driver.mode === 'exact' && !c.driver.value.split(/[,，\s]+/).filter(Boolean).length) throw new Error('请等待驱动加载完成并选择指定版本');
     if (c.driver.mode === 'exact' && c.driver.value.split(/[,，\s]+/).filter(Boolean).some(v => compareVersion(v, '0') === null)) throw new Error('驱动版本请用数字和点，多版本用逗号分隔');
   }
   // 无需构建即可在 Node 中测试业务逻辑；浏览器执行从此处开始。
@@ -412,7 +412,7 @@
     .section .picks{margin:10px 0}.section label:last-child{margin-bottom:0}.section .grid label{margin:6px 0}.section fieldset{border:0;padding:0;margin:0;min-width:0}.section fieldset:disabled{opacity:.6}.section .ordered{background:#fff;border-radius:7px;padding:4px 7px}.section .ordered button{padding:2px 8px}
     .section-title + .muted{margin:0 0 10px}.section-footer{border-top:1px solid #e1e8f2;padding-top:12px;margin-top:12px}.section-footer button{width:100%;padding:9px}.picker-title{color:#4d5f7a;font-size:12px}
     @media(max-width:520px){.grid{grid-template-columns:1fr;gap:0}.panel{right:12px;padding:14px}.top{top:-14px;margin:-14px -14px 10px;padding:14px 14px 0}}
-    .instance-option{background:#fff;border:1px solid #e1e8f2;border-radius:9px;padding:10px;gap:4px}.instance-detail{display:flex;flex-direction:column;gap:3px;min-width:0}.instance-meta{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12px}.state-badge{border-radius:5px;padding:1px 7px;background:#edf1f6;color:#61728c}.state-running{background:#e5f6eb;color:#18723b}.state-shutdown{background:#fdebed;color:#b32939}.driver-choices{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0}
+    .instance-option{background:#fff;border:1px solid #e1e8f2;border-radius:9px;padding:10px;gap:4px}.instance-detail{display:flex;flex-direction:column;gap:3px;min-width:0}.instance-meta{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12px}.state-badge{border-radius:5px;padding:1px 7px;background:#edf1f6;color:#61728c}.state-running{background:#e5f6eb;color:#18723b}.state-shutdown{background:#fdebed;color:#b32939}.driver-choices{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;margin:10px 0}.driver-choices label.check{display:flex;align-items:center;gap:8px;margin:0;padding:8px 10px;min-height:38px;background:#fff;border:1px solid #d5dfeb;border-radius:7px;font-variant-numeric:tabular-nums}.driver-choices input[type=checkbox]{flex:none;margin:0}.driver-choices label:has(input:checked){background:#e8efff;border-color:#a7bff5}
   `);
   const panel = el('section', { class: 'panel', hidden: true });
   const launcher = button('AutoDL 抢卡', () => { panel.hidden = !panel.hidden; renderTasks(); }, 'launcher primary');
@@ -424,6 +424,8 @@
     for (const [key, view] of Object.entries(views)) view.hidden = key !== name;
     for (const b of tabs.children) b.classList.toggle('selected', b.dataset.name === name);
     renderTasks();
+    if (name === 'existing') autoLoad('instances', loadInstances, 0);
+    if (name === 'new' && !regionsLoaded) autoLoad('regions', loadRegions, 0);
   }
   for (const [name, title] of [['tasks', '任务'], ['existing', '抢开机'], ['new', '抢新实例'], ['settings', '设置'], ['logs', '日志']]) {
     const b = button(title, () => show(name)); b.dataset.name = name; tabs.append(b);
@@ -475,11 +477,29 @@
   onState = renderTasks;
   GM_addValueChangeListener(KEY, () => renderTasks());
 
+  const autoTimers = new Map();
+  function cancelAuto(key) { clearTimeout(autoTimers.get(key)); autoTimers.delete(key); }
+  function autoLoad(key, fn, delay = 200) {
+    cancelAuto(key);
+    autoTimers.set(key, setTimeout(async () => {
+      autoTimers.delete(key);
+      try { await fn(); } catch (error) {
+        notice(error.message);
+        if (error instanceof ApiError && session().token && !['AccountChanged', 'SchemaChanged'].includes(error.code)) autoLoad(key, fn, 10000);
+      }
+    }, delay));
+  }
+  let regionsLoaded = false, instancesGeneration = 0;
   const instanceList = el('div'), selectedInstances = new Map();
   async function loadInstances() {
-    const rows = await api.instances(session().account); instanceList.replaceChildren(); selectedInstances.clear();
+    const generation = ++instancesGeneration, account = session().account;
+    const rows = await api.instances(account);
+    if (generation !== instancesGeneration || account !== session().account) return;
+    const previouslySelected = new Set(selectedInstances.keys());
+    instanceList.replaceChildren(); selectedInstances.clear();
     for (const r of rows) {
-      const cb = input('checkbox', '', { onchange: () => cb.checked ? selectedInstances.set(r.uuid, r) : selectedInstances.delete(r.uuid) });
+      if (previouslySelected.has(r.uuid)) selectedInstances.set(r.uuid, r);
+      const cb = input('checkbox', '', { checked: previouslySelected.has(r.uuid), onchange: () => cb.checked ? selectedInstances.set(r.uuid, r) : selectedInstances.delete(r.uuid) });
       const display = instanceDisplay(r);
       instanceList.append(el('label', { class: 'check instance-option' }, cb, el('span', { class: 'instance-detail' },
         el('strong', {}, r.name || r.uuid), el('span', { class: 'instance-meta' },
@@ -489,7 +509,7 @@
     if (!rows.length) instanceList.append(el('p', {}, '当前账号没有普通容器实例'));
   }
   views.existing.append(section(null, '选择已有实例', '可多选目标，每个实例都需要成功。',
-    button('读取我的实例', safeAction(loadInstances)), instanceList),
+    instanceList),
     section(null, '开始抢开机', '无卡运行中的实例会自动关机，再尝试 GPU 开机。',
     button('启动所选实例抢卡', safeAction(async () => {
       if (!selectedInstances.size) throw new Error('请先选择实例');
@@ -524,12 +544,15 @@
       } };
   }
   const gpuPicker = orderedPicker('可选 GPU 型号 · 多选，↑↓调整优先级', () => {
-    resetImages('GPU 已更改，请重新读取镜像'); resetDrivers(); refreshNewForm();
+    resetImages('选择 GPU 后自动加载镜像'); resetDrivers(); refreshNewForm();
+    if (gpuPicker.get().length) { autoLoad('drivers', loadDrivers); autoLoad('images', loadImages); }
   });
   const regionPicker = orderedPicker('可选地区 · 多选，↑↓调整地区优先级', () => {
     gpuQueryGeneration++; gpuPicker.setOptions([]);
-    gpuHint.textContent = regionPicker.get().length ? '已选择地区，点击下方按钮读取 GPU。' : '请先选择地区。';
+    cancelAuto('gpus');
+    gpuHint.textContent = regionPicker.get().length ? '正在加载所选地区的 GPU…' : '请先选择地区。';
     refreshNewForm();
+    if (regionPicker.get().length) autoLoad('gpus', loadRegionGpus);
   });
   const taskName = input('text', '', { placeholder: '例如：训练任务 A' });
   const gpuCount = input('number', 1, { min: 1, step: 1 });
@@ -550,14 +573,15 @@
     }));
   }
   function resetDrivers() {
+    cancelAuto('drivers');
     driverQueryGeneration++; driverVersions = []; exactVersions.clear();
-    driverValue.replaceChildren(el('option', { value: '' }, '先读取已有驱动版本')); renderDriverOptions();
-    driverHint.textContent = '地区或 GPU 已更改，请重新读取已有驱动版本。';
+    driverValue.replaceChildren(el('option', { value: '' }, '等待自动加载驱动版本')); renderDriverOptions();
+    driverHint.textContent = '选择 GPU 后自动加载已有驱动版本。';
   }
   async function loadDrivers() {
     const gpus = gpuPicker.get(); if (!gpus.length) throw new Error('先选择 GPU 型号');
     const generation = ++driverQueryGeneration, account = session().account;
-    readDriversButton.disabled = true; driverHint.textContent = '正在读取主机显卡驱动…';
+    driverHint.textContent = '正在加载主机显卡驱动…';
     try {
       const c = { gpus: gpus.map(g => g.name), regions: regionPicker.get(), gpuCount: 1 };
       const rows = await api.machines(c, account, true);
@@ -574,14 +598,15 @@
     } finally { if (generation === driverQueryGeneration) refreshNewForm(); }
   }
   const imageType = el('select', {}, el('option', { value: 'base' }, '官方基础镜像'), el('option', { value: 'private' }, '我的私有镜像'));
-  const imageSelect = el('select', {}, el('option', { value: '' }, '先选 GPU，再读取镜像'));
+  const imageSelect = el('select', {}, el('option', { value: '' }, '选择 GPU 后自动加载镜像'));
   let images = [], imageQueryGeneration = 0, gpuQueryGeneration = 0;
   const gpuHint = el('p', { class: 'muted' }, '请先选择地区。');
   function resetImages(text) {
+    cancelAuto('images');
     imageQueryGeneration++; images = [];
     imageSelect.replaceChildren(el('option', { value: '' }, text));
   }
-  imageType.addEventListener('change', () => { resetImages('请重新读取此类型的镜像'); refreshNewForm(); });
+  imageType.addEventListener('change', () => { resetImages('正在自动加载镜像…'); refreshNewForm(); if (gpuPicker.get().length) autoLoad('images', loadImages); });
   imageSelect.addEventListener('change', () => refreshNewForm());
   async function loadRegions() {
     const account = session().account;
@@ -589,11 +614,12 @@
     if (account !== session().account) return;
     if (!Array.isArray(data)) throw new Error('地区列表结构发生变化');
     regionPicker.setOptions(groupRegions(data));
+    regionsLoaded = true;
   }
   async function loadRegionGpus() {
     const regions = regionPicker.get(); if (!regions.length) throw new Error('请先选择地区');
     const generation = ++gpuQueryGeneration, account = session().account;
-    readGpusButton.disabled = true; gpuHint.textContent = '正在读取所选地区的 GPU 型号…';
+    gpuHint.textContent = '正在加载所选地区的 GPU 型号…';
     try {
       const [regional, catalog] = await Promise.all([
         api.call('/api/v1/machine/region/gpu_type', { region_sign_list: [...new Set(regions.flatMap(r => r.signs))] }, account),
@@ -624,14 +650,11 @@
       ...images.map(i => el('option', { value: i.uuid }, i.name)));
     refreshNewForm();
   }
-  const readDriversButton = button('读取已有显卡驱动', safeAction(loadDrivers));
   const minimumDriverField = label('最低驱动版本', driverValue);
   const filtersFields = el('fieldset', {}, label('每个实例 GPU 数量', gpuCount),
-    label('显卡驱动筛选', driverMode), readDriversButton, driverHint, minimumDriverField, driverExact,
+    label('显卡驱动筛选', driverMode), driverHint, minimumDriverField, driverExact,
     el('div', { class: 'grid' }, label('主机可扩容容量至少（GB）', minExpand), label('实际额外扩容（GB，0 使用基础盘）', expand)));
-  const readGpusButton = button('读取所选地区的 GPU', safeAction(loadRegionGpus));
-  const readImagesButton = button('读取可用镜像', safeAction(loadImages));
-  const imageFields = el('fieldset', {}, label('镜像来源', imageType), readImagesButton, label('使用的镜像', imageSelect));
+  const imageFields = el('fieldset', {}, label('镜像来源', imageType), label('使用的镜像', imageSelect));
   const startNewButton = button('添加并启动新实例任务', safeAction(async () => {
       const image = images.find(i => i.uuid === imageSelect.value && i.type === imageType.value);
       const selectedGpus = gpuPicker.get();
@@ -647,17 +670,15 @@
     }), 'primary');
   function refreshNewForm() {
     const hasGpu = gpuPicker.get().length > 0;
-    readGpusButton.disabled = !regionPicker.get().length;
     filtersFields.disabled = !hasGpu; imageFields.disabled = !hasGpu;
-    readDriversButton.disabled = !hasGpu;
     minimumDriverField.hidden = driverMode.value !== 'minimum'; driverExact.hidden = driverMode.value !== 'exact';
     driverValue.disabled = driverMode.value !== 'minimum' || !driverVersions.length;
     startNewButton.disabled = !hasGpu || !imageSelect.value;
   }
   driverMode.addEventListener('change', refreshNewForm);
   views.new.append(el('p', { class: 'muted' }, '每个任务创建一个实例，可添加多个独立任务。按步骤配置；抢卡时仍优先 GPU 型号，再按地区排序。'),
-    section(1, '选择地区', '先读取地区，再选择需要监控的机房。', button('读取地区', safeAction(loadRegions)), regionPicker.node),
-    section(2, '选择 GPU', '只展示所选地区中存在的型号。', gpuHint, readGpusButton, gpuPicker.node),
+    section(1, '选择地区', '地区自动加载，选择需要监控的机房。', regionPicker.node),
+    section(2, '选择 GPU', '只展示所选地区中存在的型号。', gpuHint, gpuPicker.node),
     section(3, '设置筛选条件', '选择 GPU 后，可设置卡数、显卡驱动和磁盘容量。', filtersFields),
     section(4, '选择镜像', '支持官方基础镜像和自己的私有镜像。', imageFields),
     section(5, '创建监控任务', '配置完成后自动监控，抢到一个实例即完成此任务。', label('任务名称', taskName),
@@ -688,4 +709,5 @@
       notice('测试提醒已发送');
     }))));
   show('tasks'); loop();
+  if (session().token) { autoLoad('regions', loadRegions, 0); autoLoad('instances', loadInstances, 0); }
 })();
