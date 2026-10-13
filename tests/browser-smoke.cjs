@@ -40,7 +40,10 @@ const { fresh } = require('../autodl-helper.user.js');
         case '/api/v1/instance/power_on': Object.assign(rows.find(r => r.uuid === body.instance_uuid), { status: 'running', start_mode: 'gpu' }); data = null; break;
         case '/api/v1/machine/gpu_type': data = [
           { gpu_name: 'RTX 4090D', chip_corp: 'nvidia', cpu_arch: 'x86' },
-          { gpu_name: 'RTX 4090', chip_corp: 'nvidia', cpu_arch: 'x86' }]; break;
+          { gpu_name: 'RTX 4090', chip_corp: 'nvidia', cpu_arch: 'x86' },
+          { gpu_name: 'RTX 5090', chip_corp: 'nvidia', cpu_arch: 'x86' }]; break;
+        case '/api/v1/machine/region/gpu_type': data = [{ 'RTX 4090': { idle: 0 } }];
+          if (body.region_sign_list.includes('west1')) data.push({ 'RTX 4090D': { idle: 4 } }); break;
         case '/api/v1/region/list': data = [
           { data_center: 'bj', region_name: '北京', region_sign: 'bj1', visible: 'all', used_for: 'all' },
           { data_center: 'west', region_name: '西北', region_sign: 'west1', visible: 'all', used_for: 'all' }]; break;
@@ -80,17 +83,40 @@ const { fresh } = require('../autodl-helper.user.js');
     assert.equal(calls.filter(c => c[0].endsWith('power_on')).length, 1);
 
     await host.getByRole('button', { name: '抢新实例', exact: true }).click();
-    await host.getByRole('button', { name: '读取 GPU 和地区' }).click();
+    assert.equal(await host.getByRole('button', { name: '读取所选地区的 GPU', exact: true }).isDisabled(), true);
+    assert.equal(await host.getByLabel('每个实例 GPU 数量').isDisabled(), true);
+    await host.getByRole('button', { name: '读取地区', exact: true }).click();
+    await host.getByRole('button', { name: '北京', exact: true }).click();
+    await host.getByRole('button', { name: '读取所选地区的 GPU', exact: true }).click();
+    await host.getByRole('button', { name: 'RTX 4090', exact: true }).click();
+    assert.equal(await host.getByRole('button', { name: 'RTX 4090D', exact: true }).count(), 0);
+    await host.getByRole('button', { name: '西北', exact: true }).click();
+    assert.equal(await host.getByRole('button', { name: 'RTX 4090', exact: true }).count(), 0);
+    assert.equal(await host.getByLabel('使用的镜像', { exact: true }).isDisabled(), true);
+    await host.getByRole('button', { name: '读取所选地区的 GPU', exact: true }).click();
     await host.getByRole('button', { name: 'RTX 4090D', exact: true }).click();
     await host.getByRole('button', { name: 'RTX 4090', exact: true }).click();
-    await host.getByRole('button', { name: '北京', exact: true }).click();
-    await host.getByRole('button', { name: '西北', exact: true }).click();
+    assert.equal(await host.getByRole('button', { name: 'RTX 5090', exact: true }).count(), 0);
+    assert.deepEqual(calls.filter(c => c[0].endsWith('region/gpu_type')).map(c => c[1].region_sign_list), [['bj1'], ['bj1', 'west1']]);
     await host.getByLabel('任务名称', { exact: true }).fill('训练任务 A');
     await host.getByLabel('每个实例 GPU 数量').fill('2');
     await host.getByLabel('主机可扩容容量至少（GB）').fill('500');
     await host.getByRole('button', { name: '读取可用镜像', exact: true }).click();
     await host.getByLabel('使用的镜像', { exact: true }).selectOption('base-1');
+    // 已选镜像也必须在更改地区后失效，不能误用旧配置。
+    await host.getByRole('button', { name: '北京', exact: true }).click();
+    assert.equal(await host.getByLabel('使用的镜像', { exact: true }).inputValue(), '');
+    assert.equal(await host.getByRole('button', { name: '添加并启动新实例任务', exact: true }).isDisabled(), true);
+    await host.getByRole('button', { name: '北京', exact: true }).click();
+    await host.getByRole('button', { name: '读取所选地区的 GPU', exact: true }).click();
+    await host.getByRole('button', { name: 'RTX 4090D', exact: true }).click();
+    await host.getByRole('button', { name: 'RTX 4090', exact: true }).click();
+    await host.getByRole('button', { name: '读取可用镜像', exact: true }).click();
+    await host.getByLabel('使用的镜像', { exact: true }).selectOption('base-1');
     fs.mkdirSync(path.join(__dirname, '../.research'), { recursive: true });
+    await host.locator('.section:visible').first().scrollIntoViewIfNeeded();
+    await page.screenshot({ path: path.join(__dirname, '../.research/ui-regions.png') });
+    await host.getByLabel('使用的镜像', { exact: true }).scrollIntoViewIfNeeded();
     await page.screenshot({ path: path.join(__dirname, '../.research/ui-new.png') });
     await host.getByRole('button', { name: '添加并启动新实例任务', exact: true }).click();
 
@@ -114,6 +140,8 @@ const { fresh } = require('../autodl-helper.user.js');
     assert.equal(createCount, 2);
     await page.locator('#autodl-helper-host button.launcher').click();
     await page.screenshot({ path: path.join(__dirname, '../.research/ui-tasks.png') });
+    await page.locator('#autodl-helper-host').getByRole('button', { name: '设置', exact: true }).click();
+    await page.screenshot({ path: path.join(__dirname, '../.research/ui-settings.png') });
     assert.equal(notifications.length, 3);
     // 两个页面同时接管一个尚未创建的任务，也只提交一次创建请求。
     await page.evaluate(() => {
@@ -127,7 +155,7 @@ const { fresh } = require('../autodl-helper.user.js');
     await page.waitForFunction(() => JSON.parse(localStorage.getItem('mock-gm-autodl-helper-v1')).tasks.find(t => t.id === 'concurrent')?.instanceUuid);
     assert.equal(createCount, 3);
     assert.deepEqual(errors, []);
-    console.log('PASS: 油猴面板交互、无卡转 GPU、基础/私有镜像双任务、刷新恢复、多标签页共享及逐实例通知');
+    console.log('PASS: 地区优先流程、关联 GPU 筛选和重置、油猴面板、无卡转 GPU、双任务、刷新恢复、多标签页共享及通知');
     await context.close();
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

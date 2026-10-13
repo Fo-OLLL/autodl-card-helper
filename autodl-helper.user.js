@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoDL 抢卡助手
 // @namespace    autodl-card-helper
-// @version      0.1.0
+// @version      0.2.0
 // @description  多实例抢开机、多任务抢新实例、刷新恢复和可选 Server酱通知
 // @match        https://www.autodl.com/*
 // @run-at       document-idle
@@ -54,6 +54,13 @@
       });
     }
     return out;
+  }
+  function regionalGpuOptions(rows, catalog) {
+    if (!Array.isArray(rows) || !Array.isArray(catalog)) throw new Error('地区 GPU 列表结构发生变化');
+    // 保留暂时没有空闲卡的型号，仍可用它建立持续监控任务。
+    const names = new Set(rows.flatMap(row => Object.keys(row)));
+    return catalog.filter(g => names.has(g.gpu_name) && g.chip_corp !== 'cpu')
+      .map(g => ({ ...g, id: g.gpu_name, name: g.gpu_name }));
   }
   function matchesMachine(m, c) {
     if (!c.gpus.includes(m.gpu_name) || Number(m.gpu_idle_num) < c.gpuCount) return false;
@@ -260,7 +267,7 @@
   // 无需构建即可在 Node 中测试业务逻辑；浏览器执行从此处开始。
   if (typeof module === 'object' && module.exports) {
     module.exports = { Api, ApiError, Engine, fresh, compareVersion, matchesMachine, sortMachines, createPayload,
-      groupRegions, flattenImages, isGpuRunning, serverChanUrl, validateNew }; return;
+      groupRegions, regionalGpuOptions, flattenImages, isGpuRunning, serverChanUrl, validateNew }; return;
   }
   if (window.top !== window.self || document.getElementById('autodl-helper-host')) return;
   function session() {
@@ -370,6 +377,9 @@
     field.setAttribute('aria-label', text);
     return el('label', {}, el('span', {}, text), field);
   };
+  const section = (step, title, description, ...children) => el('section', { class: 'section' },
+    el('h3', { class: 'section-title' }, ...(step ? [el('span', { class: 'step' }, String(step))] : []), title),
+    description ? el('p', { class: 'muted' }, description) : null, ...children);
   const safeAction = fn => async () => { try { await fn(); } catch (error) { notice(error.message); } };
   const style = el('style', {}, `
     :host{all:initial;font:14px/1.6 system-ui,"Microsoft YaHei",sans-serif;color:#24334a}
@@ -384,6 +394,11 @@
     .check{display:flex;flex-direction:row;align-items:center;margin:8px 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.picks{display:flex;gap:6px;flex-wrap:wrap;max-height:155px;overflow:auto}.ordered{margin:6px 0;display:flex;gap:6px;align-items:center}.ordered span{flex:1}.row{display:flex;align-items:center;gap:7px}.row input{flex:1}
     .status{font-size:12px;color:#225bd6}.log{font:12px/1.7 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere}hr{border:0;border-top:1px solid #e2e9f2;margin:16px 0}[hidden]{display:none!important}
     .top{position:sticky;top:-18px;z-index:2;background:#fff;margin:-18px -18px 10px;padding:18px 18px 0;border-bottom:1px solid #e2e9f2}
+    .section{background:#f5f8fc;border:1px solid #e1e8f2;border-radius:12px;padding:14px;margin:12px 0;min-width:0}
+    .section-title{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:650;margin:0 0 7px}.step{display:inline-flex;align-items:center;justify-content:center;width:23px;height:23px;flex:none;border-radius:7px;background:#e4edff;color:#225bd6;font-size:12px}
+    .section .picks{margin:10px 0}.section label:last-child{margin-bottom:0}.section .grid label{margin:6px 0}.section fieldset{border:0;padding:0;margin:0;min-width:0}.section fieldset:disabled{opacity:.6}.section .ordered{background:#fff;border-radius:7px;padding:4px 7px}.section .ordered button{padding:2px 8px}
+    .section-title + .muted{margin:0 0 10px}.section-footer{border-top:1px solid #e1e8f2;padding-top:12px;margin-top:12px}.section-footer button{width:100%;padding:9px}.picker-title{color:#4d5f7a;font-size:12px}
+    @media(max-width:520px){.grid{grid-template-columns:1fr;gap:0}.panel{right:12px;padding:14px}.top{top:-14px;margin:-14px -14px 10px;padding:14px 14px 0}}
   `);
   const panel = el('section', { class: 'panel', hidden: true });
   const launcher = button('AutoDL 抢卡', () => { panel.hidden = !panel.hidden; renderTasks(); }, 'launcher primary');
@@ -455,8 +470,9 @@
     }
     if (!rows.length) instanceList.append(el('p', {}, '当前账号没有普通容器实例'));
   }
-  views.existing.append(el('p', {}, '选择需要开机的实例，每个实例都要成功。无卡运行中的实例会自动关机，再尝试 GPU 开机。'),
-    button('读取我的实例', safeAction(loadInstances)), instanceList,
+  views.existing.append(section(null, '选择已有实例', '可多选目标，每个实例都需要成功。',
+    button('读取我的实例', safeAction(loadInstances)), instanceList),
+    section(null, '开始抢开机', '无卡运行中的实例会自动关机，再尝试 GPU 开机。',
     button('启动所选实例抢卡', safeAction(async () => {
       if (!selectedInstances.size) throw new Error('请先选择实例');
       const account = session().account;
@@ -468,25 +484,35 @@
           status: 'active', createdAt: Date.now(), message: '等待抢开机', nextAt: 0 });
       } });
       enableSound().catch(() => {}); show('tasks'); loop();
-    }), 'primary'));
+    }), 'primary')));
 
-  function orderedPicker(title) {
+  function orderedPicker(title, onChange = () => {}) {
     const selected = [], available = el('div', { class: 'picks' }), ordered = el('div'); let options = [];
     function render() {
       available.replaceChildren(...options.map(o => button(o.name, () => {
         const i = selected.findIndex(x => x.id === o.id);
         if (i >= 0) selected.splice(i, 1); else selected.push(o);
-        render();
+        render(); onChange();
       }, selected.some(x => x.id === o.id) ? 'selected' : '')));
       ordered.replaceChildren(...selected.map((o, i) => el('div', { class: 'ordered' }, el('span', {}, `${i + 1}. ${o.name}`),
         button('↑', () => { if (i > 0) { [selected[i - 1], selected[i]] = [selected[i], selected[i - 1]]; render(); } }),
         button('↓', () => { if (i < selected.length - 1) { [selected[i + 1], selected[i]] = [selected[i], selected[i + 1]]; render(); } }))));
     }
-    return { node: el('div', {}, el('strong', {}, title), available, ordered), get: () => clone(selected),
-      setOptions(list) { options = list; render(); } };
+    return { node: el('div', {}, el('div', { class: 'picker-title' }, title), available, ordered), get: () => clone(selected),
+      setOptions(list) {
+        options = list;
+        const refreshed = selected.map(s => list.find(o => o.id === s.id)).filter(Boolean);
+        selected.splice(0, selected.length, ...refreshed); render(); onChange();
+      } };
   }
-  const gpuPicker = orderedPicker('GPU 型号（多选，↑↓调整优先级）');
-  const regionPicker = orderedPicker('地区（多选，同 GPU 下按地区排序）');
+  const gpuPicker = orderedPicker('可选 GPU 型号 · 多选，↑↓调整优先级', () => {
+    resetImages('GPU 已更改，请重新读取镜像'); refreshNewForm();
+  });
+  const regionPicker = orderedPicker('可选地区 · 多选，↑↓调整地区优先级', () => {
+    gpuQueryGeneration++; gpuPicker.setOptions([]);
+    gpuHint.textContent = regionPicker.get().length ? '已选择地区，点击下方按钮读取 GPU。' : '请先选择地区。';
+    refreshNewForm();
+  });
   const taskName = input('text', '', { placeholder: '例如：训练任务 A' });
   const gpuCount = input('number', 1, { min: 1, step: 1 });
   const minExpand = input('number', 0, { min: 0, step: 1 });
@@ -495,17 +521,38 @@
   const driverValue = input('text', '', { placeholder: '550.54.15；多版本用逗号分隔' });
   const imageType = el('select', {}, el('option', { value: 'base' }, '官方基础镜像'), el('option', { value: 'private' }, '我的私有镜像'));
   const imageSelect = el('select', {}, el('option', { value: '' }, '先选 GPU，再读取镜像'));
-  let images = [], imageQueryGeneration = 0;
-  imageType.addEventListener('change', () => { images = []; imageSelect.replaceChildren(el('option', { value: '' }, '请重新读取此类型的镜像')); });
-  async function loadCatalog() {
+  let images = [], imageQueryGeneration = 0, gpuQueryGeneration = 0;
+  const gpuHint = el('p', { class: 'muted' }, '请先选择地区。');
+  function resetImages(text) {
+    imageQueryGeneration++; images = [];
+    imageSelect.replaceChildren(el('option', { value: '' }, text));
+  }
+  imageType.addEventListener('change', () => { resetImages('请重新读取此类型的镜像'); refreshNewForm(); });
+  imageSelect.addEventListener('change', () => refreshNewForm());
+  async function loadRegions() {
     const account = session().account;
-    const results = await Promise.allSettled([api.call('/api/v1/machine/gpu_type', undefined, account), api.call('/api/v1/region/list', undefined, account)]);
-    for (const [i, r] of results.entries()) {
-      if (r.status !== 'fulfilled') { notice(r.reason.message); continue; }
-      if (!Array.isArray(r.value)) throw new Error('型号或地区列表结构发生变化');
-      if (i === 0) gpuPicker.setOptions(r.value.filter(g => g.chip_corp !== 'cpu').map(g => ({ ...g, id: g.gpu_name, name: g.gpu_name })));
-      else regionPicker.setOptions(groupRegions(r.value));
-    }
+    const data = await api.call('/api/v1/region/list', undefined, account);
+    if (account !== session().account) return;
+    if (!Array.isArray(data)) throw new Error('地区列表结构发生变化');
+    regionPicker.setOptions(groupRegions(data));
+  }
+  async function loadRegionGpus() {
+    const regions = regionPicker.get(); if (!regions.length) throw new Error('请先选择地区');
+    const generation = ++gpuQueryGeneration, account = session().account;
+    readGpusButton.disabled = true; gpuHint.textContent = '正在读取所选地区的 GPU 型号…';
+    try {
+      const [regional, catalog] = await Promise.all([
+        api.call('/api/v1/machine/region/gpu_type', { region_sign_list: [...new Set(regions.flatMap(r => r.signs))] }, account),
+        api.call('/api/v1/machine/gpu_type', undefined, account)
+      ]);
+      if (generation !== gpuQueryGeneration || account !== session().account) return;
+      const options = regionalGpuOptions(regional, catalog);
+      gpuPicker.setOptions(options);
+      gpuHint.textContent = options.length ? `所选地区共有 ${options.length} 种 GPU 可选，暂时无空闲卡的型号也可以监控。` : '这些地区没有可选 GPU，请更换地区。';
+    } catch (error) {
+      if (generation !== gpuQueryGeneration || account !== session().account) return;
+      gpuHint.textContent = 'GPU 读取失败，请重试。'; throw error;
+    } finally { if (generation === gpuQueryGeneration) refreshNewForm(); }
   }
   async function loadImages() {
     const gpus = gpuPicker.get(); if (!gpus.length) throw new Error('先选择 GPU 型号');
@@ -521,13 +568,15 @@
     images = images.map(i => ({ ...i, chip_corp: i.chip_corp || gpus[0].chip_corp, cpu_arch: i.cpu_arch || gpus[0].cpu_arch }));
     imageSelect.replaceChildren(el('option', { value: '' }, images.length ? '请选择镜像' : '没有可用镜像'),
       ...images.map(i => el('option', { value: i.uuid }, i.name)));
+    refreshNewForm();
   }
-  views.new.append(el('p', { class: 'muted' }, '每个任务创建一个实例。多个任务可同时监控；匹配结果按 GPU 优先级、地区优先级排序。'),
-    button('读取 GPU 和地区', safeAction(loadCatalog)), label('任务名称', taskName), gpuPicker.node, label('每个实例 GPU 数量', gpuCount), regionPicker.node,
+  const filtersFields = el('fieldset', {}, label('每个实例 GPU 数量', gpuCount),
     el('div', { class: 'grid' }, label('显卡驱动筛选', driverMode), label('驱动版本', driverValue)),
-    el('div', { class: 'grid' }, label('主机可扩容容量至少（GB）', minExpand), label('实际额外扩容（GB，0 使用基础盘）', expand)),
-    label('镜像来源', imageType), button('读取可用镜像', safeAction(loadImages)), label('使用的镜像', imageSelect),
-    button('添加并启动新实例任务', safeAction(async () => {
+    el('div', { class: 'grid' }, label('主机可扩容容量至少（GB）', minExpand), label('实际额外扩容（GB，0 使用基础盘）', expand)));
+  const readGpusButton = button('读取所选地区的 GPU', safeAction(loadRegionGpus));
+  const readImagesButton = button('读取可用镜像', safeAction(loadImages));
+  const imageFields = el('fieldset', {}, label('镜像来源', imageType), readImagesButton, label('使用的镜像', imageSelect));
+  const startNewButton = button('添加并启动新实例任务', safeAction(async () => {
       const image = images.find(i => i.uuid === imageSelect.value && i.type === imageType.value);
       const selectedGpus = gpuPicker.get();
       if (image && selectedGpus.some(g => g.chip_corp !== image.chip_corp || g.cpu_arch !== image.cpu_arch)) throw new Error('GPU 架构已更改，请重新读取镜像');
@@ -539,7 +588,23 @@
       await update(s => { s.tasks.push({ id, marker: `ADLH-${id}`, kind: 'new', name: taskName.value.trim() || `新实例任务 ${s.tasks.length + 1}`,
         account, config: c, status: 'active', createdAt: Date.now(), nextAt: 0, message: '等待空闲 GPU' }); });
       enableSound().catch(() => {}); show('tasks'); loop();
-    }), 'primary'));
+    }), 'primary');
+  function refreshNewForm() {
+    const hasGpu = gpuPicker.get().length > 0;
+    readGpusButton.disabled = !regionPicker.get().length;
+    filtersFields.disabled = !hasGpu; imageFields.disabled = !hasGpu;
+    driverValue.disabled = driverMode.value === 'any';
+    startNewButton.disabled = !hasGpu || !imageSelect.value;
+  }
+  driverMode.addEventListener('change', refreshNewForm);
+  views.new.append(el('p', { class: 'muted' }, '每个任务创建一个实例，可添加多个独立任务。按步骤配置；抢卡时仍优先 GPU 型号，再按地区排序。'),
+    section(1, '选择地区', '先读取地区，再选择需要监控的机房。', button('读取地区', safeAction(loadRegions)), regionPicker.node),
+    section(2, '选择 GPU', '只展示所选地区中存在的型号。', gpuHint, readGpusButton, gpuPicker.node),
+    section(3, '设置筛选条件', '选择 GPU 后，可设置卡数、显卡驱动和磁盘容量。', filtersFields),
+    section(4, '选择镜像', '支持官方基础镜像和自己的私有镜像。', imageFields),
+    section(5, '创建监控任务', '配置完成后自动监控，抢到一个实例即完成此任务。', label('任务名称', taskName),
+      el('div', { class: 'section-footer' }, startNewButton)));
+  refreshNewForm();
 
   const settings = read().settings;
   const interval = input('number', settings.intervalSeconds, { min: 5, step: 1 });
@@ -547,10 +612,12 @@
   const desktop = input('checkbox', '', { checked: settings.desktop });
   const server = input('checkbox', '', { checked: settings.serverChan });
   const sendKey = input('password', settings.sendKey, { placeholder: '可选，填写 Server酱 SendKey', autocomplete: 'off' });
-  views.settings.append(label('全局检查间隔（秒，最小 5，默认 10）', interval),
-    el('label', { class: 'check' }, sound, '提示音'), el('label', { class: 'check' }, desktop, '浏览器桌面通知'),
-    el('label', { class: 'check' }, server, '启用 Server酱微信通知（可选）'), label('Server酱 SendKey', sendKey),
-    el('p', { class: 'muted' }, 'SendKey 只保存在本机油猴存储中。请到 Server酱后台绑定微信推送渠道。浏览器可能限制后台定时器和声音；首次点击测试提醒解锁声音。'),
+  views.settings.append(section(null, '监控频率', '所有任务共用一个检查间隔。', label('全局检查间隔（秒，最小 5，默认 10）', interval)),
+    section(null, '本地提醒', '首次点击“测试提醒”解锁声音；浏览器可能限制后台定时器和声音。',
+      el('label', { class: 'check' }, sound, '提示音'), el('label', { class: 'check' }, desktop, '浏览器桌面通知')),
+    section(null, '微信通知 · 可选', 'SendKey 只保存在本机油猴存储中。请到 Server酱后台绑定微信推送渠道。',
+      el('label', { class: 'check' }, server, '启用 Server酱微信通知（可选）'), label('Server酱 SendKey', sendKey)),
+    el('div', { class: 'bar' },
     button('保存设置', safeAction(async () => {
       const n = Number(interval.value); if (!Number.isInteger(n) || n < 5) throw new Error('检查间隔应为至少 5 秒的整数');
       if (server.checked) serverChanUrl(sendKey.value.trim());
@@ -561,6 +628,6 @@
       if (desktop.checked) GM_notification({ title: 'AutoDL 抢卡助手', text: '测试提醒：通知已启用', timeout: 8000 });
       if (server.checked) await sendServer(sendKey.value.trim(), 'AutoDL 抢卡助手测试', 'Server酱可选通知已连接');
       notice('测试提醒已发送');
-    })));
+    }))));
   show('tasks'); loop();
 })();

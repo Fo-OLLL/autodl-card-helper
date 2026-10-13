@@ -2,7 +2,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { Api, ApiError, Engine, fresh, compareVersion, sortMachines, createPayload, groupRegions,
-  flattenImages, isGpuRunning, serverChanUrl, validateNew } = require('../autodl-helper.user.js');
+  flattenImages, regionalGpuOptions, isGpuRunning, serverChanUrl, validateNew } = require('../autodl-helper.user.js');
 const copy = x => JSON.parse(JSON.stringify(x));
 const GB = 1024 ** 3;
 const config = () => ({ gpus: ['RTX 4090D', 'RTX 4090'], regions: [{ name: '北京', signs: ['bj'] }, { name: '西北', signs: ['west'] }],
@@ -69,6 +69,18 @@ test('实时地区分组和基础镜像树展开', () => {
     { region_sign: 'vip', data_center: 'private', visible: 'enterprise', used_for: 'all' }])[0].signs, ['w1', 'w2']);
   assert.equal(flattenImages([{ label_name: 'PyTorch', children: [{ label_name: '2.5', children: [
     { label_name: { uuid: 'image', v: '12.4', cpu_arch: 'x86', chip_corp: 'nvidia' } } ] }] }])[0].name, 'PyTorch / 2.5 / 12.4');
+});
+test('地区 GPU 仅展示当地型号，保留零空闲型号并合并架构信息', () => {
+  const catalog = ['RTX 4090', 'RTX 4090D', 'RTX 5090', 'CPU'].map(gpu_name => ({
+    gpu_name, chip_corp: gpu_name === 'CPU' ? 'cpu' : 'nvidia', cpu_arch: 'x86'
+  }));
+  const result = regionalGpuOptions([{ 'RTX 4090': { idle: 0 } }, { 'RTX 4090D': { idle: 2 } },
+    { 'RTX 4090': { idle: 1 }, CPU: {} }], catalog);
+  assert.deepEqual(result.map(g => g.id), ['RTX 4090', 'RTX 4090D']);
+  assert.equal(result[0].cpu_arch, 'x86');
+  assert.equal(result[0].chip_corp, 'nvidia');
+  assert.deepEqual(regionalGpuOptions([], catalog), []);
+  assert.throws(() => regionalGpuOptions({}, catalog));
 });
 test('已选择多个实例全部完成，单个成功不终止其他任务', async () => {
   const f = fixture([existing('a'), existing('b')], { instances: async () => [
