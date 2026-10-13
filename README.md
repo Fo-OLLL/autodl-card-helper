@@ -1,16 +1,30 @@
-# AutoDL 抢卡助手 v0.2.0
+# AutoDL 抢卡助手 v0.2.1
 
 可直接安装的 Tampermonkey 油猴脚本，用于 AutoDL **普通容器实例**。使用当前网页登录状态，不需要填写开发者 Token。
 
 ## 安装和使用
 
 1. 在 Chrome / Edge 安装 Tampermonkey，确保扩展允许用户脚本运行。
-2. 新建脚本，将 [`autodl-helper.user.js`](./autodl-helper.user.js) 的完整内容粘贴进去并保存。
+2. 打开 [安装 / 更新脚本](https://raw.githubusercontent.com/Fo-OLLL/autodl-card-helper/main/autodl-helper.user.js)，在 Tampermonkey 页面安装或更新。也可新建脚本，粘贴 [`autodl-helper.user.js`](./autodl-helper.user.js) 全文并保存。
 3. 登录 `https://www.autodl.com`，打开控制台或算力市场，点击右下角 **AutoDL 抢卡**。
 4. 在“设置”调整全局检查间隔，默认 10 秒、最低 5 秒；点击“测试提醒”解锁声音、检查桌面通知。
 5. 选择“抢开机”或“抢新实例”，配置后点击启动。点击启动即授权脚本自动执行所选实例关机、GPU 开机或新实例创建，并产生网站正常计费。
 
 保持浏览器和至少一个 AutoDL 标签页打开。刷新、导航到同站其他页面或重新打开后，未完成任务会自动恢复。浏览器关闭、电脑休眠、网页被丢弃期间无法执行；后台标签页的实际间隔可能被浏览器延长。
+
+## 自动更新
+
+v0.2.1 起已配置 Tampermonkey 原生自动更新：`@updateURL` 用于检查 GitHub `main` 分支上的版本，`@downloadURL` 用于下载新版脚本。每次发布都会提高 `@version`；只修改代码而不提高版本号不会触发正常版本更新。
+
+1. **现有用户先手动更新一次到 v0.2.1 或更高版本**，让油猴获得更新地址。保留同一个脚本的名称与 namespace，不要删除旧脚本再另装一个副本。
+2. 打开 Tampermonkey 管理面板 → 设置。如果没有显示相关选项，将配置模式切到高级，查找“脚本更新”并设置定期检查间隔。
+3. 在本脚本的设置中确认允许检查更新，且更新 / 下载地址与脚本头中的 GitHub Raw 地址一致。界面名称可能随油猴版本和语言变化。
+4. 需要立即更新时，从管理面板对本脚本执行“检查更新”，或打开上方安装 / 更新链接。
+5. 更新安装后刷新 AutoDL 页面，打开的旧页面才会执行新代码。脚本仍使用原有的本地存储键，已有配置、任务和 SendKey 会继续读取。
+
+自动检查由 Tampermonkey 扩展执行，AutoDL 页面不需要一直打开，但浏览器要运行且能访问 `raw.githubusercontent.com`。是否弹出更新确认由油猴设置以及新版是否新增权限决定。这是油猴自动更新，不在网页中下载并 `eval` 执行远程代码。
+
+说明参考 [Tampermonkey 官方文档](https://www.tampermonkey.net/documentation.php#meta:updateURL)。
 
 ## 两种模式
 

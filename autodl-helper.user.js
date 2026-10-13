@@ -1,7 +1,11 @@
 // ==UserScript==
 // @name         AutoDL 抢卡助手
 // @namespace    autodl-card-helper
-// @version      0.2.0
+// @version      0.2.1
+// @homepageURL  https://github.com/Fo-OLLL/autodl-card-helper
+// @supportURL   https://github.com/Fo-OLLL/autodl-card-helper/issues
+// @updateURL    https://raw.githubusercontent.com/Fo-OLLL/autodl-card-helper/main/autodl-helper.user.js
+// @downloadURL  https://raw.githubusercontent.com/Fo-OLLL/autodl-card-helper/main/autodl-helper.user.js
 // @description  多实例抢开机、多任务抢新实例、刷新恢复和可选 Server酱通知
 // @match        https://www.autodl.com/*
 // @run-at       document-idle
