@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoDL 抢卡助手
 // @namespace    autodl-card-helper
-// @version      0.2.3
+// @version      0.3.0
 // @homepageURL  https://github.com/Fo-OLLL/autodl-card-helper
 // @supportURL   https://github.com/Fo-OLLL/autodl-card-helper/issues
 // @updateURL    https://raw.githubusercontent.com/Fo-OLLL/autodl-card-helper/main/autodl-helper.user.js
@@ -115,6 +115,43 @@
       duration: 1, num: c.gpuCount, expand_data_disk: disk } };
   }
   function isGpuRunning(row) { return row.status === 'running' && row.start_mode === 'gpu'; }
+  function cloneSourceConfig(source, snapshot, regions) {
+    const machine = snapshot.machine_info_snapshot, image = snapshot.image;
+    const region = groupRegions(regions).find(r => r.signs.includes(source.region_sign));
+    const gpu = machine?.gpu_name || source.snapshot_gpu_alias_name;
+    const extra = Number(snapshot.expand_data_disk_size ?? source.expand_data_disk_size);
+    const base = Number(machine?.max_instance_disk_size);
+    if (!region || !gpu || !image || !Number.isInteger(source.req_gpu_amount) || source.req_gpu_amount < 1 ||
+      !Number.isFinite(extra) || extra < 0 || !Number.isFinite(base) || base <= 0) {
+      throw new Error('无法确认源实例的地区、显卡或数据盘容量，保留任务等待核对');
+    }
+    return { gpus: [gpu], gpuCount: source.req_gpu_amount, regions: [region], driver: { mode: 'any', value: '' },
+      minExpandGb: 0, expandGb: Math.ceil(extra / GiB), sourceDataBytes: base + extra,
+      image: { type: source.private_image_uuid ? 'private' : 'base', uuid: source.private_image_uuid || image.image_name || '',
+        name: '源实例系统盘', chip_corp: image.chip_corp, cpu_arch: image.cpu_arch, cuda: image.cuda_version },
+      cloneImage: { base_image_uuid: image.image_type === 'public' ? image.image_name : '',
+        private_image_uuid: source.private_image_uuid || '', reproduction_uuid: source.reproduction_uuid || '',
+        reproduction_id: Number(source.reproduction_id) || 0, cg_application_uuid: snapshot.cg_application_uuid || '',
+        cg_application_info: snapshot.cg_application_info || {} } };
+  }
+  function cloneTargetConfig(c, machine) {
+    const base = Number(machine.max_instance_disk_size);
+    if (!Number.isFinite(base) || base <= 0) return null;
+    const expandGb = Math.max(c.expandGb, Math.ceil(Math.max(0, c.sourceDataBytes - base) / GiB));
+    return { ...c, expandGb };
+  }
+  function clonePayload(task, machine) {
+    const c = cloneTargetConfig(task.config, machine);
+    if (!c) throw new Error('目标主机的数据盘容量未知');
+    const payload = createPayload({ ...task, config: c }, machine);
+    payload.instance_uuid = task.sourceUuid;
+    Object.assign(payload.instance_info, c.cloneImage, { copy_data_disk_after_clone: true,
+      keep_src_user_service_address_after_clone: false, ft_sparse: false });
+    return payload;
+  }
+  function cloneDataReady(row) {
+    return ['Succeed', 'Success'].includes(row.additional_info?.copy_data_disk_after_clone_status);
+  }
   const shutdownStates = new Set(['shutdown', 'shutdown_by_starting_error', 'shutdown_by_running_error']);
   class ApiError extends Error {
     constructor(message, code = 'NetworkError', uncertain = false) {
@@ -165,6 +202,10 @@
     powerOn(uuid, account) { return this.call('/api/v1/instance/power_on', { instance_uuid: uuid }, account); }
     powerOff(uuid, account) { return this.call('/api/v1/instance/power_off', { instance_uuid: uuid }, account); }
     create(task, m) { return this.call('/api/v1/order/instance/create/payg', createPayload(task, m), task.account); }
+    clone(task, m) { return this.call('/api/v1/order/instance/clone/payg', clonePayload(task, m), task.account); }
+    snapshot(uuid, account) { return this.call(`/api/v1/instance/snapshot?instance_uuid=${encodeURIComponent(uuid)}`, undefined, account); }
+    regions(account) { return this.call('/api/v1/region/list', undefined, account); }
+    retryClone(uuid, account) { return this.call('/api/v1/instance/clone/retry', { instance_uuid: uuid }, account); }
     init(uuid, account) { return this.call('/api/v1/instance/init', { instance_uuid: uuid }, account); }
   }
   class Engine {
@@ -189,7 +230,7 @@
         const rows = await this.api.instances(t.account);
         t = this.read().tasks.find(t => t.id === id);
         if (!t || !active(t)) return;
-        if (t.kind === 'new' && !t.instanceUuid) {
+        if (['new', 'clone'].includes(t.kind) && !t.instanceUuid) {
           const found = rows.filter(r => r.name === t.marker);
           if (found.length > 1) { await this.message(id, '发现多个同名创建结果，请在控制台核对；任务保留'); return; }
           if (found.length === 1) {
@@ -199,7 +240,26 @@
           } else if (t.intent) {
             await this.message(id, `创建结果待核对，持续查找实例 ${t.marker}，不会重复下单`); return;
           } else {
-            const machines = sortMachines(await this.api.machines(t.config, t.account), t.config);
+            if (t.kind === 'clone') {
+              const source = rows.find(r => r.uuid === t.sourceUuid);
+              if (!source) { await this.message(id, '等待源实例出现，未创建新实例'); return; }
+              if (!shutdownStates.has(source.status)) {
+                if (source.status === 'running' && (!t.lastAction || this.now() - t.lastAction.at >= 60000)) {
+                  if (!await this.patch(id, t => { t.lastAction = { type: 'off', at: this.now() }; return true; })) return;
+                  await this.api.powerOff(source.uuid, t.account);
+                }
+                await this.message(id, '克隆前等待源实例关机；系统盘和数据盘都将复制'); return;
+              }
+              const config = cloneSourceConfig(source, await this.api.snapshot(source.uuid, t.account), await this.api.regions(t.account));
+              if (!await this.patch(id, task => { task.config = config; return true; })) return;
+              t = this.read().tasks.find(t => t.id === id);
+              if (!active(t)) return;
+            }
+            const inventory = await this.api.machines(t.config, t.account);
+            const machines = t.kind === 'clone' ? inventory.filter(m => {
+              const c = cloneTargetConfig(t.config, m);
+              return c && m.machine_id !== rows.find(r => r.uuid === t.sourceUuid)?.machine_id && matchesMachine(m, c);
+            }) : sortMachines(inventory, t.config);
             if (!machines.length) { await this.message(id, '等待符合条件的空闲 GPU'); return; }
             const machine = machines[0];
             const prepared = await this.patch(id, t => {
@@ -209,7 +269,7 @@
             });
             if (!prepared || !active(this.read().tasks.find(t => t.id === id))) return;
             try {
-              const result = await this.api.create(prepared, machine);
+              const result = prepared.kind === 'clone' ? await this.api.clone(prepared, machine) : await this.api.create(prepared, machine);
               const uuid = typeof result === 'string' ? result : result?.instance_uuid || result?.uuid;
               // 取消后的已发送请求仍需保存返回值，以便显示其实际结果。
               await this.update(s => { const task = s.tasks.find(t => t.id === id); if (!task) return;
@@ -225,7 +285,17 @@
         }
         const row = rows.find(r => r.uuid === t.instanceUuid);
         if (!row) { await this.message(id, '等待实例出现在列表中；请确认实例未被释放'); return; }
-        if (isGpuRunning(row)) { await this.success(id, row); return; }
+        if (t.kind === 'clone' && row.status === 'created_clone_failed') {
+          if (t.lastAction?.type === 'retryClone' && this.now() - t.lastAction.at < 60000) return;
+          if (!await this.patch(id, t => { t.lastAction = { type: 'retryClone', at: this.now() }; return true; })) return;
+          await this.api.retryClone(row.uuid, t.account); await this.message(id, '重试原克隆实例，不重复创建'); return;
+        }
+        if (isGpuRunning(row)) {
+          if (t.kind === 'clone' && !cloneDataReady(row)) {
+            await this.message(id, `GPU 已运行，等待数据盘复制完成：${row.additional_info?.copy_data_disk_after_clone_status || '状态待确认'}`); return;
+          }
+          await this.success(id, row); return;
+        }
         if (row.status === 'running' && row.start_mode === 'non_gpu') {
           if (t.lastAction?.type === 'off' && this.now() - t.lastAction.at < 60000) {
             await this.message(id, '等待无卡实例关机完成'); return;
@@ -240,7 +310,7 @@
           if (!await this.patch(id, t => { t.lastAction = { type: 'on', at: this.now() }; return true; })) return;
           await this.api.powerOn(row.uuid, t.account);
           await this.message(id, '开机已受理，等待 GPU 运行');
-        } else if (t.kind === 'new' && ['create_failed', 're_init_failed'].includes(row.status)) {
+        } else if (['new', 'clone'].includes(t.kind) && ['create_failed', 're_init_failed'].includes(row.status)) {
           if (t.lastAction?.type === 'init' && this.now() - t.lastAction.at < 60000) return;
           if (!await this.patch(id, t => { t.lastAction = { type: 'init', at: this.now() }; return true; })) return;
           await this.api.init(row.uuid, t.account);
@@ -280,6 +350,7 @@
   // 无需构建即可在 Node 中测试业务逻辑；浏览器执行从此处开始。
   if (typeof module === 'object' && module.exports) {
     module.exports = { Api, ApiError, Engine, fresh, compareVersion, matchesMachine, sortMachines, createPayload,
+      cloneSourceConfig, cloneTargetConfig, clonePayload, cloneDataReady,
       groupRegions, regionalGpuOptions, availableDrivers, instanceDisplay, flattenImages, isGpuRunning, serverChanUrl, validateNew }; return;
   }
   if (window.top !== window.self || document.getElementById('autodl-helper-host')) return;
@@ -459,6 +530,7 @@
         el('div', {}, t.message || '等待首次检查'));
       if (t.kind === 'new') card.append(el('div', { class: 'muted' },
         `${t.config.gpus.join(' → ')} · ${t.config.gpuCount} 卡 · ${t.config.regions.map(r => r.name).join(' → ')}\n镜像：${t.config.image.name}`));
+      if (t.kind === 'clone') card.append(el('div', { class: 'muted' }, `克隆源：${t.sourceUuid}\n系统盘＋数据盘 · 同地区同型号同卡数 · 原实例保留`));
       if (t.instanceUuid) card.append(el('div', { class: 'muted' }, `实例：${t.instanceUuid}`));
       if (active(t) && t.intent && Date.now() - t.intent.at > 120000) card.append(button('已核对未创建，重新尝试', safeAction(async () => {
         if (!window.confirm(`请先到控制台核对不存在名称为 ${t.marker} 的实例和正在创建的实例。确认后重新发送创建请求？`)) return;
@@ -508,18 +580,23 @@
     }
     if (!rows.length) instanceList.append(el('p', {}, '当前账号没有普通容器实例'));
   }
+  const existingMode = el('select', {}, el('option', { value: 'existing' }, '原实例开机'),
+    el('option', { value: 'clone' }, '克隆为新实例并开机（含数据盘）'));
   views.existing.append(section(null, '选择已有实例', '可多选目标，每个实例都需要成功。',
     instanceList),
-    section(null, '开始抢开机', '无卡运行中的实例会自动关机，再尝试 GPU 开机。',
+    section(null, '开始抢开机', '原实例开机：无卡模式会先关机。克隆模式：源实例先关机，在同地区其他主机创建按量计费实例，复制系统盘和数据盘；原实例保留。',
+    label('开机方式', existingMode),
     button('启动所选实例抢卡', safeAction(async () => {
       if (!selectedInstances.size) throw new Error('请先选择实例');
       const account = session().account;
       if (!account) throw new Error('请先登录 AutoDL');
       const rows = [...selectedInstances.values()];
       await update(s => { for (const r of rows) {
-        if (s.tasks.some(t => t.account === account && active(t) && t.instanceUuid === r.uuid)) continue;
-        s.tasks.push({ id: uid(), kind: 'existing', name: r.name || r.uuid, account, instanceUuid: r.uuid,
-          status: 'active', createdAt: Date.now(), message: '等待抢开机', nextAt: 0 });
+        if (s.tasks.some(t => t.account === account && active(t) && (t.sourceUuid || t.instanceUuid) === r.uuid)) continue;
+        const id = uid(), cloning = existingMode.value === 'clone';
+        s.tasks.push({ id, kind: existingMode.value, name: `${cloning ? '克隆：' : ''}${r.name || r.uuid}`, account,
+          ...(cloning ? { sourceUuid: r.uuid, marker: `ADLH-${id}` } : { instanceUuid: r.uuid }),
+          status: 'active', createdAt: Date.now(), message: cloning ? '等待克隆（含数据盘）' : '等待抢开机', nextAt: 0 });
       } });
       enableSound().catch(() => {}); show('tasks'); loop();
     }), 'primary')));

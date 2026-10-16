@@ -2,7 +2,8 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { Api, ApiError, Engine, fresh, compareVersion, sortMachines, createPayload, groupRegions,
-  flattenImages, regionalGpuOptions, availableDrivers, instanceDisplay, isGpuRunning, serverChanUrl, validateNew } = require('../autodl-helper.user.js');
+  flattenImages, regionalGpuOptions, availableDrivers, instanceDisplay, cloneSourceConfig, clonePayload, cloneDataReady,
+  isGpuRunning, serverChanUrl, validateNew } = require('../autodl-helper.user.js');
 const copy = x => JSON.parse(JSON.stringify(x));
 const GB = 1024 ** 3;
 const config = () => ({ gpus: ['RTX 4090D', 'RTX 4090'], regions: [{ name: '北京', signs: ['bj'] }, { name: '西北', signs: ['west'] }],
@@ -17,7 +18,9 @@ function fixture(tasks, api = {}) {
   let state = { ...fresh(), tasks: copy(tasks) }, time = 100000;
   const calls = [], defaults = {
     instances: async () => [], machines: async () => [machine()],
-    create: async () => 'created', powerOn: async () => {}, powerOff: async () => {}, init: async () => {}
+    create: async () => 'created', clone: async () => 'cloned', snapshot: async () => sourceSnapshot(),
+    regions: async () => [{ data_center: 'west', region_name: '西北', region_sign: 'west', visible: 'all', used_for: 'all' }],
+    retryClone: async () => {}, powerOn: async () => {}, powerOff: async () => {}, init: async () => {}
   };
   const wrapped = Object.fromEntries(Object.entries({ ...defaults, ...api }).map(([name, fn]) => [name, async (...args) => {
     calls.push([name, ...copy(args)]); return fn(...args);
@@ -26,6 +29,61 @@ function fixture(tasks, api = {}) {
   return { engine: new Engine({ api: wrapped, read, update, now: () => time }), read, update, calls,
     advance(n) { time += n; }, restart() { return new Engine({ api: wrapped, read, update, now: () => time }); } };
 }
+const sourceRow = () => ({ uuid: 'src', name: '源实例', machine_id: 'original', region_sign: 'west',
+  status: 'shutdown', req_gpu_amount: 2, snapshot_gpu_alias_name: 'RTX 4090D', expand_data_disk_size: 100 * GB });
+const sourceSnapshot = () => ({ expand_data_disk_size: 100 * GB,
+  machine_info_snapshot: { gpu_name: 'RTX 4090D', max_instance_disk_size: 100 * GB },
+  image: { image_type: 'public', image_name: 'base', chip_corp: 'nvidia', cpu_arch: 'x86', cuda_version: '12.1' } });
+const cloneTask = () => ({ id: 'clone', marker: 'ADLH-clone', name: '克隆任务', kind: 'clone', sourceUuid: 'src', account: 'account', status: 'active' });
+test('克隆请求强制复制数据盘，目标盘至少与源盘同大，源 UUID 不被替换', () => {
+  const t = cloneTask();
+  t.config = cloneSourceConfig(sourceRow(), sourceSnapshot(), [{ data_center: 'west', region_name: '西北', region_sign: 'west', visible: 'all', used_for: 'all' }]);
+  const p = clonePayload(t, machine({ max_instance_disk_size: 50 * GB }));
+  assert.equal(p.instance_uuid, 'src'); assert.equal(p.instance_info.copy_data_disk_after_clone, true);
+  assert.equal(p.instance_info.expand_data_disk, 150 * GB); assert.equal(p.price_info.expand_data_disk, 150 * GB);
+  assert.equal(p.instance_info.instance_name, 'ADLH-clone'); assert.equal(p.instance_info.keep_src_user_service_address_after_clone, false);
+});
+test('克隆先关机原实例，即使原实例 GPU 正在运行也不算成功', async () => {
+  const f = fixture([cloneTask()], { instances: async () => [{ ...sourceRow(), status: 'running', start_mode: 'gpu' }] });
+  await f.engine.tick();
+  assert.equal(f.calls.filter(c => c[0] === 'powerOff').length, 1);
+  assert.equal(f.calls.filter(c => c[0] === 'clone').length, 0); assert.equal(f.read().tasks[0].status, 'active');
+});
+test('克隆仅选择同型号同地区的其他主机，等待数据盘完成后通知', async () => {
+  let rows = [sourceRow()];
+  const f = fixture([cloneTask()], { instances: async () => rows,
+    machines: async () => [machine({ machine_id: 'original', max_instance_disk_size: 100 * GB }),
+      machine({ machine_id: 'too-small', max_instance_disk_size: 50 * GB, max_data_disk_expand_size: 149 * GB }),
+      machine({ machine_id: 'target', max_instance_disk_size: 50 * GB })] });
+  await f.engine.tick();
+  assert.equal(f.calls.find(c => c[0] === 'clone')[2].machine_id, 'target');
+  rows.push({ uuid: 'cloned', name: 'ADLH-clone', status: 'running', start_mode: 'gpu',
+    additional_info: { copy_data_disk_after_clone_status: 'Running' } });
+  await f.restart().tick(); assert.equal(f.read().tasks[0].status, 'active'); assert.equal(f.read().events.length, 0);
+  rows[1].additional_info.copy_data_disk_after_clone_status = 'Succeed';
+  await f.engine.tick(); assert.equal(f.read().tasks[0].status, 'success'); assert.equal(f.read().events.length, 1);
+  assert.equal(f.read().tasks[0].sourceUuid, 'src'); assert.equal(f.calls.filter(c => c[0] === 'clone').length, 1);
+});
+test('克隆结果不确定时刷新不重复下单，通过名称认领原克隆实例', async () => {
+  let rows = [sourceRow()];
+  const f = fixture([cloneTask()], { instances: async () => rows,
+    machines: async () => [machine({ max_instance_disk_size: 100 * GB })],
+    clone: async () => { throw new ApiError('超时', 'NetworkError', true); } });
+  await f.engine.tick(); f.advance(300000); await f.restart().tick();
+  assert.equal(f.calls.filter(c => c[0] === 'clone').length, 1);
+  rows.push({ uuid: 'recovered', name: 'ADLH-clone', status: 'running', start_mode: 'gpu',
+    additional_info: { copy_data_disk_after_clone_status: 'Succeed' } });
+  await f.restart().tick(); assert.equal(f.read().tasks[0].instanceUuid, 'recovered');
+});
+test('缺少容量或复制完成状态时不冒报克隆完成；克隆失败重试原目标', async () => {
+  assert.throws(() => cloneSourceConfig(sourceRow(), { image: {} }, []));
+  assert.equal(cloneDataReady({ additional_info: { copy_data_disk_after_clone_status: 'Failed' } }), false);
+  assert.equal(cloneDataReady({}), false);
+  const t = cloneTask(); t.instanceUuid = 'target';
+  const f = fixture([t], { instances: async () => [{ uuid: 'target', status: 'created_clone_failed' }] });
+  await f.engine.tick(); assert.equal(f.calls.filter(c => c[0] === 'retryClone').length, 1);
+  assert.equal(f.calls.filter(c => c[0] === 'clone').length, 0);
+});
 
 test('驱动版本按数字比较，未知版本不能通过受限筛选', () => {
   assert.equal(compareVersion('550.9', '550.10'), -1);

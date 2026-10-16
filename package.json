@@ -1,6 +1,6 @@
 {
   "name": "autodl-card-helper",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "private": true,
   "description": "AutoDL 普通容器实例抢卡油猴脚本",
   "scripts": {

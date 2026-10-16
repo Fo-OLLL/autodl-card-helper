@@ -13,9 +13,9 @@ const { fresh } = require('../autodl-helper.user.js');
   try {
     const context = await browser.newContext({ viewport: { width: 1280, height: 1000 } });
     const errors = [], calls = [], notifications = [];
-    let rows = [{ uuid: 'existing-1', name: '我的无卡实例', snapshot_gpu_alias_name: 'RTX 4090D', status: 'running', start_mode: 'non_gpu', req_gpu_amount: 1 },
+    let rows = [{ uuid: 'existing-1', name: '我的无卡实例', snapshot_gpu_alias_name: 'RTX 4090D', machine_id: 'original', region_sign: 'west1', expand_data_disk_size: 0, status: 'running', start_mode: 'non_gpu', req_gpu_amount: 1 },
       { uuid: 'shutdown-2', name: '已关机实例', snapshot_gpu_alias_name: 'A100-SXM4-80GB', status: 'shutdown', start_mode: 'gpu', req_gpu_amount: 2 }];
-    let createCount = 0;
+    let createCount = 0, cloneCount = 0;
     await context.exposeFunction('recordNotification', data => notifications.push(data));
     await context.addInitScript(() => {
       localStorage.setItem('token', 'mock-token');
@@ -39,6 +39,9 @@ const { fresh } = require('../autodl-helper.user.js');
         case '/api/v1/instance': data = { list: rows, result_total: rows.length, page_size: 90 }; break;
         case '/api/v1/instance/power_off': rows.find(r => r.uuid === body.instance_uuid).status = 'shutdown'; data = null; break;
         case '/api/v1/instance/power_on': Object.assign(rows.find(r => r.uuid === body.instance_uuid), { status: 'running', start_mode: 'gpu' }); data = null; break;
+        case '/api/v1/instance/snapshot': data = { expand_data_disk_size: 0,
+          machine_info_snapshot: { gpu_name: 'RTX 4090D', max_instance_disk_size: 100 * 1024 ** 3 },
+          image: { image_type: 'public', image_name: 'base-1', chip_corp: 'nvidia', cpu_arch: 'x86', cuda_version: '12.4' } }; break;
         case '/api/v1/machine/gpu_type': data = [
           { gpu_name: 'RTX 4090D', chip_corp: 'nvidia', cpu_arch: 'x86' },
           { gpu_name: 'RTX 4090', chip_corp: 'nvidia', cpu_arch: 'x86' },
@@ -53,11 +56,16 @@ const { fresh } = require('../autodl-helper.user.js');
         case '/api/v1/image/private/get': data = [{ image_uuid: 'private-1', name: '我的训练环境', cuda_v: '12.4', chip_corp: 'nvidia', cpu_arch: 'x86' }]; break;
         case '/api/v1/user/machine/list': data = { list: [{ machine_id: 'machine1', gpu_name: 'RTX 4090D', gpu_idle_num: 4,
           region_sign: 'west1', region_name: '西北', on_line: 1, driver_version: '570.10', max_data_disk_expand_size: 1024 ** 4,
-          chip_corp: 'nvidia', cpu_arch: 'x86', highest_cuda_version: '12.8' }], result_total: 1, page_size: 90 };
+          chip_corp: 'nvidia', cpu_arch: 'x86', highest_cuda_version: '12.8', max_instance_disk_size: 100 * 1024 ** 3 }], result_total: 1, page_size: 90 };
           if (body.gpu_idle_num === 0) { data.list.push({ ...data.list[0], machine_id: 'busy', gpu_idle_num: 0, driver_version: '550.54.15' }); data.result_total = 2; } break;
         case '/api/v1/order/instance/create/payg':
           data = `created-${++createCount}`;
           rows.push({ uuid: data, name: body.instance_info.instance_name, status: 'running', start_mode: 'gpu', req_gpu_amount: body.instance_info.req_gpu_amount }); break;
+        case '/api/v1/order/instance/clone/payg':
+          assert.equal(body.instance_uuid, 'existing-1'); assert.equal(body.instance_info.copy_data_disk_after_clone, true);
+          data = `cloned-${++cloneCount}`;
+          rows.push({ uuid: data, name: body.instance_info.instance_name, status: 'running', start_mode: 'gpu',
+            additional_info: { copy_data_disk_after_clone_status: 'Running' } }); break;
         default: throw Error(`未预期请求：${url.pathname}`);
       }
       await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ code: 'Success', data }) });
@@ -169,6 +177,25 @@ const { fresh } = require('../autodl-helper.user.js');
     await page.locator('#autodl-helper-host').getByRole('button', { name: '设置', exact: true }).click();
     await page.screenshot({ path: path.join(__dirname, '../.research/ui-settings.png') });
     assert.equal(notifications.length, 3);
+    // 从抢开机页面选择克隆，源实例先关机，新实例必须等数据盘完成。
+    await page.locator('#autodl-helper-host').getByRole('button', { name: '抢开机', exact: true }).click();
+    await page.clock.runFor(300);
+    await page.locator('#autodl-helper-host').getByLabel(/我的无卡实例/).check();
+    await page.locator('#autodl-helper-host').getByLabel('开机方式', { exact: true }).selectOption('clone');
+    await page.screenshot({ path: path.join(__dirname, '../.research/ui-clone.png') });
+    await page.locator('#autodl-helper-host').getByRole('button', { name: '启动所选实例抢卡' }).click();
+    await page.waitForFunction(() => JSON.parse(localStorage.getItem('mock-gm-autodl-helper-v1')).tasks.some(t => t.kind === 'clone'));
+    await advance(11000);
+    await page.waitForFunction(() => JSON.parse(localStorage.getItem('mock-gm-autodl-helper-v1')).tasks.find(t => t.kind === 'clone')?.lastAction?.type === 'off');
+    await advance(11000);
+    await page.waitForFunction(() => JSON.parse(localStorage.getItem('mock-gm-autodl-helper-v1')).tasks.find(t => t.kind === 'clone')?.instanceUuid);
+    await advance(11000);
+    assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem('mock-gm-autodl-helper-v1')).tasks.find(t => t.kind === 'clone').status), 'active');
+    assert.equal(notifications.length, 3);
+    rows.find(r => r.uuid === 'cloned-1').additional_info.copy_data_disk_after_clone_status = 'Succeed';
+    await advance(11000);
+    await page.waitForFunction(() => JSON.parse(localStorage.getItem('mock-gm-autodl-helper-v1')).tasks.find(t => t.kind === 'clone')?.status === 'success');
+    assert.equal(cloneCount, 1); assert.equal(notifications.length, 4);
     // 两个页面同时接管一个尚未创建的任务，也只提交一次创建请求。
     await page.evaluate(() => {
       const key = 'mock-gm-autodl-helper-v1', s = JSON.parse(localStorage.getItem(key));
