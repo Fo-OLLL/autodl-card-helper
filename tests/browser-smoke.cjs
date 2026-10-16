@@ -54,7 +54,7 @@ const { fresh } = require('../autodl-helper.user.js');
         case '/api/v1/image/all': data = [{ label_name: 'PyTorch', children: [{ label_name: '2.5', children: [
           { label_name: '3.12', children: [{ label_name: { uuid: 'base-1', v: '12.4', chip_corp: 'nvidia', cpu_arch: 'x86' } }] }] }] }]; break;
         case '/api/v1/image/private/get': data = [{ image_uuid: 'private-1', name: '我的训练环境', cuda_v: '12.4', chip_corp: 'nvidia', cpu_arch: 'x86' }]; break;
-        case '/api/v1/user/machine/list': data = { list: [{ machine_id: 'machine1', gpu_name: 'RTX 4090D', gpu_idle_num: 4,
+        case '/api/v1/user/machine/list': data = { list: [{ machine_id: 'machine1', gpu_name: body.gpu_type_name?.[0] || 'RTX 4090D', gpu_idle_num: 4,
           region_sign: 'west1', region_name: '西北', on_line: 1, driver_version: '570.10', max_data_disk_expand_size: 1024 ** 4,
           chip_corp: 'nvidia', cpu_arch: 'x86', highest_cuda_version: '12.8', max_instance_disk_size: 100 * 1024 ** 3 }], result_total: 1, page_size: 90 };
           if (body.gpu_idle_num === 0) { data.list.push({ ...data.list[0], machine_id: 'busy', gpu_idle_num: 0, driver_version: '550.54.15' }); data.result_total = 2; } break;
@@ -63,6 +63,7 @@ const { fresh } = require('../autodl-helper.user.js');
           rows.push({ uuid: data, name: body.instance_info.instance_name, status: 'running', start_mode: 'gpu', req_gpu_amount: body.instance_info.req_gpu_amount }); break;
         case '/api/v1/order/instance/clone/payg':
           assert.equal(body.instance_uuid, 'existing-1'); assert.equal(body.instance_info.copy_data_disk_after_clone, true);
+          assert.equal(body.instance_info.req_gpu_amount, 3); assert.equal(body.instance_info.expand_data_disk, 100 * 1024 ** 3);
           data = `cloned-${++cloneCount}`;
           rows.push({ uuid: data, name: body.instance_info.instance_name, status: 'running', start_mode: 'gpu',
             additional_info: { copy_data_disk_after_clone_status: 'Running' } }); break;
@@ -126,7 +127,7 @@ const { fresh } = require('../autodl-helper.user.js');
     await page.screenshot({ path: path.join(__dirname, '../.research/ui-drivers.png') });
     await host.getByLabel('任务名称', { exact: true }).fill('训练任务 A');
     await host.getByLabel('每个实例 GPU 数量').fill('2');
-    await host.getByLabel('主机可扩容容量至少（GB）').fill('500');
+    await host.getByLabel('主机可扩容容量至少（GB）', { exact: true }).fill('500');
     await page.clock.runFor(300);
     await host.getByLabel('使用的镜像', { exact: true }).selectOption('base-1');
     // 已选镜像也必须在更改地区后失效，不能误用旧配置。
@@ -182,9 +183,22 @@ const { fresh } = require('../autodl-helper.user.js');
     await page.clock.runFor(300);
     await page.locator('#autodl-helper-host').getByLabel(/我的无卡实例/).check();
     await page.locator('#autodl-helper-host').getByLabel('开机方式', { exact: true }).selectOption('clone');
+    await page.clock.runFor(300);
+    const cloneEditor = page.locator('#autodl-helper-host .clone-filter-editor');
+    await cloneEditor.getByRole('button', { name: 'RTX 4090', exact: true }).click();
+    await page.clock.runFor(300);
+    await cloneEditor.getByLabel('克隆 GPU 数量', { exact: true }).fill('3');
+    await cloneEditor.getByLabel('克隆主机可扩容容量至少（GB）', { exact: true }).fill('500');
+    await cloneEditor.getByLabel('克隆实际额外扩容（GB）', { exact: true }).fill('100');
+    await cloneEditor.getByLabel('克隆显卡驱动筛选', { exact: true }).selectOption('exact');
+    await cloneEditor.getByLabel('570.10', { exact: true }).check();
+    assert.equal(await cloneEditor.getByRole('button', { name: '北京', exact: true }).count(), 0);
+    assert.equal(await cloneEditor.getByLabel('镜像来源', { exact: true }).count(), 0);
     await page.screenshot({ path: path.join(__dirname, '../.research/ui-clone.png') });
     await page.locator('#autodl-helper-host').getByRole('button', { name: '启动所选实例抢卡' }).click();
     await page.waitForFunction(() => JSON.parse(localStorage.getItem('mock-gm-autodl-helper-v1')).tasks.some(t => t.kind === 'clone'));
+    const cloneSaved = await page.evaluate(() => JSON.parse(localStorage.getItem('mock-gm-autodl-helper-v1')).tasks.find(t => t.kind === 'clone'));
+    assert.deepEqual(cloneSaved.targetFilters.gpus, ['RTX 4090']); assert.equal(cloneSaved.targetFilters.gpuCount, 3);
     await advance(11000);
     await page.waitForFunction(() => JSON.parse(localStorage.getItem('mock-gm-autodl-helper-v1')).tasks.find(t => t.kind === 'clone')?.lastAction?.type === 'off');
     await advance(11000);

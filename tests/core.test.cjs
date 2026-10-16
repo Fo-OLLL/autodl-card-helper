@@ -2,7 +2,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { Api, ApiError, Engine, fresh, compareVersion, sortMachines, createPayload, groupRegions,
-  flattenImages, regionalGpuOptions, availableDrivers, instanceDisplay, cloneSourceConfig, clonePayload, cloneDataReady,
+  flattenImages, regionalGpuOptions, availableDrivers, instanceDisplay, cloneSourceConfig, clonePayload, cloneDataReady, applyCloneFilters,
   isGpuRunning, serverChanUrl, validateNew } = require('../autodl-helper.user.js');
 const copy = x => JSON.parse(JSON.stringify(x));
 const GB = 1024 ** 3;
@@ -48,6 +48,25 @@ test('克隆先关机原实例，即使原实例 GPU 正在运行也不算成功
   await f.engine.tick();
   assert.equal(f.calls.filter(c => c[0] === 'powerOff').length, 1);
   assert.equal(f.calls.filter(c => c[0] === 'clone').length, 0); assert.equal(f.read().tasks[0].status, 'active');
+});
+test('克隆可更换 GPU/卡数及筛选条件，但不能覆盖源地区和镜像', () => {
+  const base = cloneSourceConfig(sourceRow(), sourceSnapshot(), [{ data_center: 'west', region_name: '西北', region_sign: 'west', visible: 'all', used_for: 'all' }]);
+  const c = applyCloneFilters(base, { gpus: ['RTX 4090'], gpuCount: 3, minExpandGb: 500, expandGb: 20,
+    driver: { mode: 'minimum', value: '570.10' }, regions: [{ signs: ['bj'] }], image: { uuid: 'wrong' } });
+  assert.deepEqual(c.gpus, ['RTX 4090']); assert.equal(c.gpuCount, 3); assert.equal(c.expandGb, 100);
+  assert.deepEqual(c.regions, base.regions); assert.deepEqual(c.image, base.image);
+  assert.equal(c.driver.value, '570.10'); assert.equal(c.minExpandGb, 500);
+});
+test('克隆目标按自选卡型优先级筛选，忽略跨地区及不符驱动主机', async () => {
+  const task = cloneTask(); task.targetFilters = { gpus: ['RTX 4090', 'RTX 4090D'], gpuCount: 3,
+    driver: { mode: 'exact', value: '570.10' }, minExpandGb: 500, expandGb: 100 };
+  const candidate = overrides => machine({ max_instance_disk_size: 100 * GB, gpu_idle_num: 4, driver_version: '570.10', ...overrides });
+  const f = fixture([task], { instances: async () => [sourceRow()], machines: async () => [
+    candidate({ machine_id: 'wrong-region', gpu_name: 'RTX 4090', region_sign: 'bj' }),
+    candidate({ machine_id: 'wrong-driver', gpu_name: 'RTX 4090', driver_version: '550.54.15' }),
+    candidate({ machine_id: 'fallback' }), candidate({ machine_id: 'preferred', gpu_name: 'RTX 4090' })] });
+  await f.engine.tick(); assert.equal(f.calls.find(c => c[0] === 'clone')[2].machine_id, 'preferred');
+  assert.equal(f.read().tasks[0].config.gpuCount, 3);
 });
 test('克隆仅选择同型号同地区的其他主机，等待数据盘完成后通知', async () => {
   let rows = [sourceRow()];

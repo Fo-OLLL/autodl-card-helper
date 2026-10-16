@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoDL 抢卡助手
 // @namespace    autodl-card-helper
-// @version      0.3.0
+// @version      0.3.1
 // @homepageURL  https://github.com/Fo-OLLL/autodl-card-helper
 // @supportURL   https://github.com/Fo-OLLL/autodl-card-helper/issues
 // @updateURL    https://raw.githubusercontent.com/Fo-OLLL/autodl-card-helper/main/autodl-helper.user.js
@@ -140,6 +140,14 @@
     const expandGb = Math.max(c.expandGb, Math.ceil(Math.max(0, c.sourceDataBytes - base) / GiB));
     return { ...c, expandGb };
   }
+  function applyCloneFilters(sourceConfig, filters) {
+    if (!filters) return sourceConfig; // 兼容已保存的旧版克隆任务。
+    const c = { ...sourceConfig, gpus: [...filters.gpus], gpuCount: filters.gpuCount,
+      driver: { ...filters.driver }, minExpandGb: filters.minExpandGb,
+      expandGb: Math.max(sourceConfig.expandGb, filters.expandGb) };
+    validateNew({ ...c, image: { uuid: 'source-instance' } });
+    return c; // 地区、镜像及源盘容量始终由源实例决定。
+  }
   function clonePayload(task, machine) {
     const c = cloneTargetConfig(task.config, machine);
     if (!c) throw new Error('目标主机的数据盘容量未知');
@@ -250,16 +258,16 @@
                 }
                 await this.message(id, '克隆前等待源实例关机；系统盘和数据盘都将复制'); return;
               }
-              const config = cloneSourceConfig(source, await this.api.snapshot(source.uuid, t.account), await this.api.regions(t.account));
+              const config = applyCloneFilters(cloneSourceConfig(source, await this.api.snapshot(source.uuid, t.account), await this.api.regions(t.account)), t.targetFilters);
               if (!await this.patch(id, task => { task.config = config; return true; })) return;
               t = this.read().tasks.find(t => t.id === id);
               if (!active(t)) return;
             }
             const inventory = await this.api.machines(t.config, t.account);
-            const machines = t.kind === 'clone' ? inventory.filter(m => {
+            const machines = t.kind === 'clone' ? sortMachines(inventory.filter(m => {
               const c = cloneTargetConfig(t.config, m);
               return c && m.machine_id !== rows.find(r => r.uuid === t.sourceUuid)?.machine_id && matchesMachine(m, c);
-            }) : sortMachines(inventory, t.config);
+            }), t.config) : sortMachines(inventory, t.config);
             if (!machines.length) { await this.message(id, '等待符合条件的空闲 GPU'); return; }
             const machine = machines[0];
             const prepared = await this.patch(id, t => {
@@ -350,7 +358,7 @@
   // 无需构建即可在 Node 中测试业务逻辑；浏览器执行从此处开始。
   if (typeof module === 'object' && module.exports) {
     module.exports = { Api, ApiError, Engine, fresh, compareVersion, matchesMachine, sortMachines, createPayload,
-      cloneSourceConfig, cloneTargetConfig, clonePayload, cloneDataReady,
+      cloneSourceConfig, cloneTargetConfig, clonePayload, cloneDataReady, applyCloneFilters,
       groupRegions, regionalGpuOptions, availableDrivers, instanceDisplay, flattenImages, isGpuRunning, serverChanUrl, validateNew }; return;
   }
   if (window.top !== window.self || document.getElementById('autodl-helper-host')) return;
@@ -530,7 +538,7 @@
         el('div', {}, t.message || '等待首次检查'));
       if (t.kind === 'new') card.append(el('div', { class: 'muted' },
         `${t.config.gpus.join(' → ')} · ${t.config.gpuCount} 卡 · ${t.config.regions.map(r => r.name).join(' → ')}\n镜像：${t.config.image.name}`));
-      if (t.kind === 'clone') card.append(el('div', { class: 'muted' }, `克隆源：${t.sourceUuid}\n系统盘＋数据盘 · 同地区同型号同卡数 · 原实例保留`));
+      if (t.kind === 'clone') card.append(el('div', { class: 'muted' }, `克隆源：${t.sourceUuid}\n系统盘＋数据盘 · 地区固定为源实例地区 · 原实例保留\n目标：${t.targetFilters ? `${t.targetFilters.gpus.join(' → ')} · ${t.targetFilters.gpuCount} 卡` : '沿用原型号和卡数'}`));
       if (t.instanceUuid) card.append(el('div', { class: 'muted' }, `实例：${t.instanceUuid}`));
       if (active(t) && t.intent && Date.now() - t.intent.at > 120000) card.append(button('已核对未创建，重新尝试', safeAction(async () => {
         if (!window.confirm(`请先到控制台核对不存在名称为 ${t.marker} 的实例和正在创建的实例。确认后重新发送创建请求？`)) return;
@@ -571,7 +579,10 @@
     instanceList.replaceChildren(); selectedInstances.clear();
     for (const r of rows) {
       if (previouslySelected.has(r.uuid)) selectedInstances.set(r.uuid, r);
-      const cb = input('checkbox', '', { checked: previouslySelected.has(r.uuid), onchange: () => cb.checked ? selectedInstances.set(r.uuid, r) : selectedInstances.delete(r.uuid) });
+      const cb = input('checkbox', '', { checked: previouslySelected.has(r.uuid), onchange: () => {
+        if (cb.checked) selectedInstances.set(r.uuid, r); else selectedInstances.delete(r.uuid);
+        refreshCloneEditor();
+      } });
       const display = instanceDisplay(r);
       instanceList.append(el('label', { class: 'check instance-option' }, cb, el('span', { class: 'instance-detail' },
         el('strong', {}, r.name || r.uuid), el('span', { class: 'instance-meta' },
@@ -579,23 +590,27 @@
           el('span', {}, `${display.gpu} · ${display.count} 卡`), display.mode ? el('span', { class: 'muted' }, display.mode) : null))));
     }
     if (!rows.length) instanceList.append(el('p', {}, '当前账号没有普通容器实例'));
+    refreshCloneEditor();
   }
   const existingMode = el('select', {}, el('option', { value: 'existing' }, '原实例开机'),
     el('option', { value: 'clone' }, '克隆为新实例并开机（含数据盘）'));
+  const clonePanel = el('div', { hidden: true });
+  existingMode.addEventListener('change', () => refreshCloneEditor());
   views.existing.append(section(null, '选择已有实例', '可多选目标，每个实例都需要成功。',
     instanceList),
     section(null, '开始抢开机', '原实例开机：无卡模式会先关机。克隆模式：源实例先关机，在同地区其他主机创建按量计费实例，复制系统盘和数据盘；原实例保留。',
-    label('开机方式', existingMode),
+    label('开机方式', existingMode), clonePanel,
     button('启动所选实例抢卡', safeAction(async () => {
       if (!selectedInstances.size) throw new Error('请先选择实例');
       const account = session().account;
       if (!account) throw new Error('请先登录 AutoDL');
       const rows = [...selectedInstances.values()];
+      const targetFilters = existingMode.value === 'clone' ? readCloneFilters() : null;
       await update(s => { for (const r of rows) {
         if (s.tasks.some(t => t.account === account && active(t) && (t.sourceUuid || t.instanceUuid) === r.uuid)) continue;
         const id = uid(), cloning = existingMode.value === 'clone';
         s.tasks.push({ id, kind: existingMode.value, name: `${cloning ? '克隆：' : ''}${r.name || r.uuid}`, account,
-          ...(cloning ? { sourceUuid: r.uuid, marker: `ADLH-${id}` } : { instanceUuid: r.uuid }),
+          ...(cloning ? { sourceUuid: r.uuid, marker: `ADLH-${id}`, targetFilters } : { instanceUuid: r.uuid }),
           status: 'active', createdAt: Date.now(), message: cloning ? '等待克隆（含数据盘）' : '等待抢开机', nextAt: 0 });
       } });
       enableSound().catch(() => {}); show('tasks'); loop();
@@ -761,6 +776,83 @@
     section(5, '创建监控任务', '配置完成后自动监控，抢到一个实例即完成此任务。', label('任务名称', taskName),
       el('div', { class: 'section-footer' }, startNewButton)));
   refreshNewForm();
+
+  // 克隆目标与新实例使用相同筛选结构；地区和镜像固定由源实例提供。
+  clonePanel.className = 'clone-filter-editor';
+  let cloneScopeKey = '', cloneScopeGeneration = 0, cloneDriverGeneration = 0, cloneRegions = [], cloneScopeReady = false;
+  const cloneScopeHint = el('p', { class: 'muted' }, '先选择源实例，自动加载其地区的 GPU。');
+  const cloneDriverHint = el('p', { class: 'muted' }, '选择目标 GPU 后自动加载已有驱动。');
+  const cloneCount = input('number', 1, { min: 1, step: 1 });
+  const cloneMinExpand = input('number', 0, { min: 0, step: 1 });
+  const cloneExpand = input('number', 0, { min: 0, step: 1 });
+  const cloneDriverMode = el('select', {}, el('option', { value: 'any' }, '不限制'),
+    el('option', { value: 'minimum' }, '最低版本'), el('option', { value: 'exact' }, '指定版本'));
+  const cloneDriverMinimum = el('select', {}, el('option', { value: '' }, '选择 GPU 后自动加载'));
+  const cloneDriverExact = el('div', { class: 'driver-choices', hidden: true });
+  const cloneExactVersions = new Set();
+  const cloneMinimumField = label('克隆最低驱动版本', cloneDriverMinimum);
+  function updateCloneDriverMode() {
+    cloneMinimumField.hidden = cloneDriverMode.value !== 'minimum';
+    cloneDriverExact.hidden = cloneDriverMode.value !== 'exact';
+  }
+  cloneDriverMode.addEventListener('change', updateCloneDriverMode);
+  const cloneGpuPicker = orderedPicker('目标 GPU · 多选，↑↓调整优先级', () => {
+    cloneDriverGeneration++; cancelAuto('clone-drivers'); cloneExactVersions.clear();
+    cloneDriverMinimum.replaceChildren(el('option', { value: '' }, '选择 GPU 后自动加载'));
+    cloneDriverExact.replaceChildren();
+    if (cloneGpuPicker.get().length) autoLoad('clone-drivers', loadCloneDrivers);
+    cloneDriverHint.textContent = cloneGpuPicker.get().length ? '正在加载目标 GPU 的驱动…' : '选择目标 GPU 后自动加载已有驱动。';
+  });
+  async function loadCloneDrivers() {
+    const gpus = cloneGpuPicker.get().map(g => g.name); if (!gpus.length || !cloneScopeReady) return;
+    const generation = ++cloneDriverGeneration, account = session().account;
+    const rows = await api.machines({ gpus, regions: cloneRegions, gpuCount: 1 }, account, true);
+    if (generation !== cloneDriverGeneration || account !== session().account) return;
+    const versions = availableDrivers(rows.filter(r => gpus.includes(r.gpu_name) && cloneRegions.some(region => region.signs.includes(r.region_sign))));
+    cloneDriverMinimum.replaceChildren(el('option', { value: '' }, '请选择最低驱动版本'), ...versions.map(v => el('option', { value: v }, v)));
+    cloneDriverExact.replaceChildren(...versions.map(v => el('label', { class: 'check' },
+      input('checkbox', '', { onchange: e => { if (e.target.checked) cloneExactVersions.add(v); else cloneExactVersions.delete(v); } }), v)));
+    cloneDriverHint.textContent = versions.length ? `已加载 ${versions.length} 个驱动版本，指定版本可多选。` : '暂无有效驱动版本，可选择“不限制”。';
+  }
+  function refreshCloneEditor() {
+    clonePanel.hidden = existingMode.value !== 'clone';
+    const rows = [...selectedInstances.values()];
+    const key = clonePanel.hidden ? '' : `${session().account}|${rows.map(r => `${r.uuid}:${r.region_sign}`).sort().join('|')}`;
+    if (key === cloneScopeKey) return;
+    cloneScopeKey = key; cloneScopeGeneration++; cloneScopeReady = false;
+    cancelAuto('clone-gpus'); cloneGpuPicker.setOptions([]); cloneRegions = [];
+    if (clonePanel.hidden || !rows.length) { cloneScopeHint.textContent = '请先选择源实例，地区固定为源实例地区。'; return; }
+    cloneScopeHint.textContent = '正在自动加载源实例地区的 GPU…';
+    autoLoad('clone-gpus', loadCloneGpus);
+  }
+  async function loadCloneGpus() {
+    const generation = cloneScopeGeneration, account = session().account, sources = [...selectedInstances.values()];
+    if (!sources.length || clonePanel.hidden) return;
+    const regions = groupRegions(await api.regions(account));
+    const selected = sources.map(source => regions.find(r => r.signs.includes(source.region_sign)));
+    if (selected.some(r => !r)) throw new Error('无法确定源实例地区，暂不允许克隆');
+    const uniqueRegions = [...new Map(selected.map(r => [r.id, r])).values()];
+    const [catalog, ...regional] = await Promise.all([api.call('/api/v1/machine/gpu_type', undefined, account),
+      ...uniqueRegions.map(r => api.call('/api/v1/machine/region/gpu_type', { region_sign_list: r.signs }, account))]);
+    if (generation !== cloneScopeGeneration || account !== session().account) return;
+    const common = regional.map(rows => new Set(regionalGpuOptions(rows, catalog).map(g => g.id)));
+    cloneRegions = uniqueRegions; cloneScopeReady = true;
+    cloneGpuPicker.setOptions(catalog.filter(g => common.every(set => set.has(g.gpu_name))).map(g => ({ ...g, id: g.gpu_name, name: g.gpu_name })));
+    cloneScopeHint.textContent = `地区固定：${uniqueRegions.map(r => r.name).join('、')}。${common.length > 1 ? '仅列出各源地区共同支持的卡型；每个任务在自己的源地区克隆。' : '可选择该地区的其他卡型，暂时无空闲卡的型号也能监控。'}`;
+  }
+  function readCloneFilters() {
+    if (!cloneScopeReady) throw new Error('请等待克隆目标卡型加载完成');
+    const c = { gpus: cloneGpuPicker.get().map(g => g.name), gpuCount: Number(cloneCount.value),
+      driver: { mode: cloneDriverMode.value, value: cloneDriverMode.value === 'minimum' ? cloneDriverMinimum.value : cloneDriverMode.value === 'exact' ? [...cloneExactVersions].join(',') : '' },
+      minExpandGb: Number(cloneMinExpand.value), expandGb: Number(cloneExpand.value) };
+    validateNew({ ...c, regions: cloneRegions, image: { uuid: 'source-instance' } }); return c;
+  }
+  clonePanel.append(section(null, '克隆目标筛选', '可更换显卡和卡数；源实例地区及系统盘固定，不提供地区或镜像选择。',
+    cloneScopeHint, cloneGpuPicker.node, label('克隆 GPU 数量', cloneCount), label('克隆显卡驱动筛选', cloneDriverMode),
+    cloneDriverHint, cloneMinimumField, cloneDriverExact,
+    el('div', { class: 'grid' }, label('克隆主机可扩容容量至少（GB）', cloneMinExpand), label('克隆实际额外扩容（GB）', cloneExpand)),
+    el('p', { class: 'muted' }, '始终复制系统盘和数据盘。若所选扩容小于完整复制所需容量，会自动提高目标盘容量。')));
+  updateCloneDriverMode();
 
   const settings = read().settings;
   const interval = input('number', settings.intervalSeconds, { min: 5, step: 1 });
