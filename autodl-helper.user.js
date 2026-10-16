@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoDL 抢卡助手
 // @namespace    autodl-card-helper
-// @version      0.3.1
+// @version      0.3.2
 // @homepageURL  https://github.com/Fo-OLLL/autodl-card-helper
 // @supportURL   https://github.com/Fo-OLLL/autodl-card-helper/issues
 // @updateURL    https://raw.githubusercontent.com/Fo-OLLL/autodl-card-helper/main/autodl-helper.user.js
@@ -77,6 +77,11 @@
   }
   function matchesMachine(m, c) {
     if (!c.gpus.includes(m.gpu_name) || Number(m.gpu_idle_num) < c.gpuCount) return false;
+    const minMemoryGb = c.minMemoryGb || 0;
+    if (minMemoryGb > 0) {
+      const perGpuBytes = Number(m.mem_per_gpu);
+      if (!Number.isFinite(perGpuBytes) || perGpuBytes <= 0 || perGpuBytes * c.gpuCount / GiB < minMemoryGb) return false;
+    }
     if ([3, 4, 5, 6].includes(Number(m.on_line))) return false;
     if (m.max_instance_num != null && Number(m.max_instance_num) <= Number(m.binding_instance_num)) return false;
     if (!c.regions.some(r => r.signs.includes(m.region_sign))) return false;
@@ -143,7 +148,7 @@
   function applyCloneFilters(sourceConfig, filters) {
     if (!filters) return sourceConfig; // 兼容已保存的旧版克隆任务。
     const c = { ...sourceConfig, gpus: [...filters.gpus], gpuCount: filters.gpuCount,
-      driver: { ...filters.driver }, minExpandGb: filters.minExpandGb,
+      driver: { ...filters.driver }, minExpandGb: filters.minExpandGb, minMemoryGb: filters.minMemoryGb || 0,
       expandGb: Math.max(sourceConfig.expandGb, filters.expandGb) };
     validateNew({ ...c, image: { uuid: 'source-instance' } });
     return c; // 地区、镜像及源盘容量始终由源实例决定。
@@ -351,6 +356,7 @@
     if (!c.gpus?.length || !c.regions?.length || !c.image?.uuid) throw new Error('请选择 GPU、地区和镜像');
     if (!Number.isInteger(c.gpuCount) || c.gpuCount < 1) throw new Error('GPU 数量必须为正整数');
     if (![c.minExpandGb, c.expandGb].every(x => Number.isInteger(x) && x >= 0)) throw new Error('磁盘容量必须为非负整数');
+    if (c.minMemoryGb !== undefined && (!Number.isFinite(c.minMemoryGb) || c.minMemoryGb < 0)) throw new Error('最低内存容量必须为非负数');
     if (c.driver.mode === 'minimum' && compareVersion(c.driver.value, '0') === null) throw new Error('请等待驱动加载完成并选择最低版本');
     if (c.driver.mode === 'exact' && !c.driver.value.split(/[,，\s]+/).filter(Boolean).length) throw new Error('请等待驱动加载完成并选择指定版本');
     if (c.driver.mode === 'exact' && c.driver.value.split(/[,，\s]+/).filter(Boolean).some(v => compareVersion(v, '0') === null)) throw new Error('驱动版本请用数字和点，多版本用逗号分隔');
@@ -537,8 +543,8 @@
       card.append(actions, el('div', { class: 'status' }, { active: '监控中', success: '已成功', cancelled: '已取消' }[t.status]),
         el('div', {}, t.message || '等待首次检查'));
       if (t.kind === 'new') card.append(el('div', { class: 'muted' },
-        `${t.config.gpus.join(' → ')} · ${t.config.gpuCount} 卡 · ${t.config.regions.map(r => r.name).join(' → ')}\n镜像：${t.config.image.name}`));
-      if (t.kind === 'clone') card.append(el('div', { class: 'muted' }, `克隆源：${t.sourceUuid}\n系统盘＋数据盘 · 地区固定为源实例地区 · 原实例保留\n目标：${t.targetFilters ? `${t.targetFilters.gpus.join(' → ')} · ${t.targetFilters.gpuCount} 卡` : '沿用原型号和卡数'}`));
+        `${t.config.gpus.join(' → ')} · ${t.config.gpuCount} 卡 · ${t.config.regions.map(r => r.name).join(' → ')}${t.config.minMemoryGb ? ` · 内存≥${t.config.minMemoryGb}GB` : ''}\n镜像：${t.config.image.name}`));
+      if (t.kind === 'clone') card.append(el('div', { class: 'muted' }, `克隆源：${t.sourceUuid}\n系统盘＋数据盘 · 地区固定为源实例地区 · 原实例保留\n目标：${t.targetFilters ? `${t.targetFilters.gpus.join(' → ')} · ${t.targetFilters.gpuCount} 卡${t.targetFilters.minMemoryGb ? ` · 内存≥${t.targetFilters.minMemoryGb}GB` : ''}` : '沿用原型号和卡数'}`));
       if (t.instanceUuid) card.append(el('div', { class: 'muted' }, `实例：${t.instanceUuid}`));
       if (active(t) && t.intent && Date.now() - t.intent.at > 120000) card.append(button('已核对未创建，重新尝试', safeAction(async () => {
         if (!window.confirm(`请先到控制台核对不存在名称为 ${t.marker} 的实例和正在创建的实例。确认后重新发送创建请求？`)) return;
@@ -648,6 +654,7 @@
   });
   const taskName = input('text', '', { placeholder: '例如：训练任务 A' });
   const gpuCount = input('number', 1, { min: 1, step: 1 });
+  const minMemory = input('number', 0, { min: 0, step: 'any' });
   const minExpand = input('number', 0, { min: 0, step: 1 });
   const expand = input('number', 0, { min: 0, step: 1 });
   const driverMode = el('select', {}, el('option', { value: 'any' }, '不限制'), el('option', { value: 'minimum' }, '最低版本'), el('option', { value: 'exact' }, '指定版本'));
@@ -743,7 +750,8 @@
     refreshNewForm();
   }
   const minimumDriverField = label('最低驱动版本', driverValue);
-  const filtersFields = el('fieldset', {}, label('每个实例 GPU 数量', gpuCount),
+  const filtersFields = el('fieldset', {}, el('div', { class: 'grid' }, label('每个实例 GPU 数量', gpuCount), label('实例最低内存（GB，0 不限制）', minMemory)),
+    el('p', { class: 'muted' }, '内存按每张 GPU 分配的容量 × 所选卡数计算，筛选实例总内存。'),
     label('显卡驱动筛选', driverMode), driverHint, minimumDriverField, driverExact,
     el('div', { class: 'grid' }, label('主机可扩容容量至少（GB）', minExpand), label('实际额外扩容（GB，0 使用基础盘）', expand)));
   const imageFields = el('fieldset', {}, label('镜像来源', imageType), label('使用的镜像', imageSelect));
@@ -752,7 +760,7 @@
       const selectedGpus = gpuPicker.get();
       if (image && selectedGpus.some(g => g.chip_corp !== image.chip_corp || g.cpu_arch !== image.cpu_arch)) throw new Error('GPU 架构已更改，请重新读取镜像');
       const c = { gpus: selectedGpus.map(g => g.name), regions: regionPicker.get(), gpuCount: Number(gpuCount.value),
-        driver: { mode: driverMode.value, value: driverMode.value === 'minimum' ? driverValue.value : driverMode.value === 'exact' ? [...exactVersions].join(',') : '' }, minExpandGb: Number(minExpand.value), expandGb: Number(expand.value), image };
+        driver: { mode: driverMode.value, value: driverMode.value === 'minimum' ? driverValue.value : driverMode.value === 'exact' ? [...exactVersions].join(',') : '' }, minExpandGb: Number(minExpand.value), expandGb: Number(expand.value), minMemoryGb: Number(minMemory.value), image };
       validateNew(c);
       const account = session().account; if (!account) throw new Error('请先登录 AutoDL');
       const id = uid();
@@ -771,7 +779,7 @@
   views.new.append(el('p', { class: 'muted' }, '每个任务创建一个实例，可添加多个独立任务。按步骤配置；抢卡时仍优先 GPU 型号，再按地区排序。'),
     section(1, '选择地区', '地区自动加载，选择需要监控的机房。', regionPicker.node),
     section(2, '选择 GPU', '只展示所选地区中存在的型号。', gpuHint, gpuPicker.node),
-    section(3, '设置筛选条件', '选择 GPU 后，可设置卡数、显卡驱动和磁盘容量。', filtersFields),
+    section(3, '设置筛选条件', '选择 GPU 后，可设置卡数、内存、显卡驱动和磁盘容量。', filtersFields),
     section(4, '选择镜像', '支持官方基础镜像和自己的私有镜像。', imageFields),
     section(5, '创建监控任务', '配置完成后自动监控，抢到一个实例即完成此任务。', label('任务名称', taskName),
       el('div', { class: 'section-footer' }, startNewButton)));
@@ -783,6 +791,7 @@
   const cloneScopeHint = el('p', { class: 'muted' }, '先选择源实例，自动加载其地区的 GPU。');
   const cloneDriverHint = el('p', { class: 'muted' }, '选择目标 GPU 后自动加载已有驱动。');
   const cloneCount = input('number', 1, { min: 1, step: 1 });
+  const cloneMemory = input('number', 0, { min: 0, step: 'any' });
   const cloneMinExpand = input('number', 0, { min: 0, step: 1 });
   const cloneExpand = input('number', 0, { min: 0, step: 1 });
   const cloneDriverMode = el('select', {}, el('option', { value: 'any' }, '不限制'),
@@ -844,11 +853,13 @@
     if (!cloneScopeReady) throw new Error('请等待克隆目标卡型加载完成');
     const c = { gpus: cloneGpuPicker.get().map(g => g.name), gpuCount: Number(cloneCount.value),
       driver: { mode: cloneDriverMode.value, value: cloneDriverMode.value === 'minimum' ? cloneDriverMinimum.value : cloneDriverMode.value === 'exact' ? [...cloneExactVersions].join(',') : '' },
-      minExpandGb: Number(cloneMinExpand.value), expandGb: Number(cloneExpand.value) };
+      minExpandGb: Number(cloneMinExpand.value), expandGb: Number(cloneExpand.value), minMemoryGb: Number(cloneMemory.value) };
     validateNew({ ...c, regions: cloneRegions, image: { uuid: 'source-instance' } }); return c;
   }
   clonePanel.append(section(null, '克隆目标筛选', '可更换显卡和卡数；源实例地区及系统盘固定，不提供地区或镜像选择。',
-    cloneScopeHint, cloneGpuPicker.node, label('克隆 GPU 数量', cloneCount), label('克隆显卡驱动筛选', cloneDriverMode),
+    cloneScopeHint, cloneGpuPicker.node,
+    el('div', { class: 'grid' }, label('克隆 GPU 数量', cloneCount), label('克隆实例最低内存（GB，0 不限制）', cloneMemory)),
+    el('p', { class: 'muted' }, '按每张 GPU 分配的内存 × 目标卡数筛选实例总内存。'), label('克隆显卡驱动筛选', cloneDriverMode),
     cloneDriverHint, cloneMinimumField, cloneDriverExact,
     el('div', { class: 'grid' }, label('克隆主机可扩容容量至少（GB）', cloneMinExpand), label('克隆实际额外扩容（GB）', cloneExpand)),
     el('p', { class: 'muted' }, '始终复制系统盘和数据盘。若所选扩容小于完整复制所需容量，会自动提高目标盘容量。')));

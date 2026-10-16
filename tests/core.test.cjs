@@ -110,6 +110,25 @@ test('驱动版本按数字比较，未知版本不能通过受限筛选', () =>
   assert.equal(compareVersion('', '550'), null);
   assert.equal(sortMachines([machine({ driver_version: 'unknown' })], config()).length, 0);
 });
+test('最低内存按每卡内存乘目标卡数计算，旧任务和零门槛不受影响', () => {
+  const c = { ...config(), minMemoryGb: 128 };
+  assert.equal(sortMachines([machine({ mem_per_gpu: 64 * GB })], c).length, 1);
+  assert.equal(sortMachines([machine({ mem_per_gpu: 63 * GB })], c).length, 0);
+  assert.equal(sortMachines([machine({})], c).length, 0);
+  assert.equal(sortMachines([machine({ mem_per_gpu: 64 * GB })], { ...c, gpuCount: 1 }).length, 0);
+  assert.equal(sortMachines([machine({})], { ...c, minMemoryGb: 0 }).length, 1);
+  assert.throws(() => validateNew({ ...config(), minMemoryGb: -1 }));
+  assert.throws(() => validateNew({ ...config(), minMemoryGb: NaN }));
+});
+test('克隆目标保留最低内存条件并用更改后的卡数计算', async () => {
+  const task = cloneTask(); task.targetFilters = { gpus: ['RTX 4090D'], gpuCount: 3, minMemoryGb: 192,
+    driver: { mode: 'any', value: '' }, minExpandGb: 0, expandGb: 100 };
+  const candidate = overrides => machine({ gpu_idle_num: 3, max_instance_disk_size: 100 * GB, ...overrides });
+  const f = fixture([task], { instances: async () => [sourceRow()], machines: async () => [
+    candidate({ machine_id: 'small', mem_per_gpu: 32 * GB }), candidate({ machine_id: 'enough', mem_per_gpu: 64 * GB })] });
+  await f.engine.tick(); assert.equal(f.calls.find(c => c[0] === 'clone')[2].machine_id, 'enough');
+  assert.equal(f.read().tasks[0].config.minMemoryGb, 192);
+});
 test('GPU 优先于地区，多卡数量和 GB/字节转换参与筛选', () => {
   const c = config();
   const rows = [machine({ machine_id: 'lowerGpu', gpu_name: 'RTX 4090', region_sign: 'bj' }),

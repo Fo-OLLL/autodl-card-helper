@@ -56,7 +56,7 @@ const { fresh } = require('../autodl-helper.user.js');
         case '/api/v1/image/private/get': data = [{ image_uuid: 'private-1', name: '我的训练环境', cuda_v: '12.4', chip_corp: 'nvidia', cpu_arch: 'x86' }]; break;
         case '/api/v1/user/machine/list': data = { list: [{ machine_id: 'machine1', gpu_name: body.gpu_type_name?.[0] || 'RTX 4090D', gpu_idle_num: 4,
           region_sign: 'west1', region_name: '西北', on_line: 1, driver_version: '570.10', max_data_disk_expand_size: 1024 ** 4,
-          chip_corp: 'nvidia', cpu_arch: 'x86', highest_cuda_version: '12.8', max_instance_disk_size: 100 * 1024 ** 3 }], result_total: 1, page_size: 90 };
+          chip_corp: 'nvidia', cpu_arch: 'x86', highest_cuda_version: '12.8', mem_per_gpu: 64 * 1024 ** 3, max_instance_disk_size: 100 * 1024 ** 3 }], result_total: 1, page_size: 90 };
           if (body.gpu_idle_num === 0) { data.list.push({ ...data.list[0], machine_id: 'busy', gpu_idle_num: 0, driver_version: '550.54.15' }); data.result_total = 2; } break;
         case '/api/v1/order/instance/create/payg':
           data = `created-${++createCount}`;
@@ -127,6 +127,7 @@ const { fresh } = require('../autodl-helper.user.js');
     await page.screenshot({ path: path.join(__dirname, '../.research/ui-drivers.png') });
     await host.getByLabel('任务名称', { exact: true }).fill('训练任务 A');
     await host.getByLabel('每个实例 GPU 数量').fill('2');
+    await host.getByLabel('实例最低内存（GB，0 不限制）', { exact: true }).fill('128');
     await host.getByLabel('主机可扩容容量至少（GB）', { exact: true }).fill('500');
     await page.clock.runFor(300);
     await host.getByLabel('使用的镜像', { exact: true }).selectOption('base-1');
@@ -153,6 +154,7 @@ const { fresh } = require('../autodl-helper.user.js');
     await page.waitForFunction(() => JSON.parse(localStorage.getItem('mock-gm-autodl-helper-v1')).tasks.some(t => t.kind === 'new'));
     const saved = await page.evaluate(() => JSON.parse(localStorage.getItem('mock-gm-autodl-helper-v1')).tasks.find(t => t.kind === 'new'));
     assert.equal(saved.config.driver.mode, 'exact');
+    assert.equal(saved.config.minMemoryGb, 128);
     assert.deepEqual(saved.config.driver.value.split(','), ['570.10', '550.54.15']);
 
     // 第二个任务使用私有镜像，两个任务都应各创建一个。
@@ -188,6 +190,7 @@ const { fresh } = require('../autodl-helper.user.js');
     await cloneEditor.getByRole('button', { name: 'RTX 4090', exact: true }).click();
     await page.clock.runFor(300);
     await cloneEditor.getByLabel('克隆 GPU 数量', { exact: true }).fill('3');
+    await cloneEditor.getByLabel('克隆实例最低内存（GB，0 不限制）', { exact: true }).fill('128');
     await cloneEditor.getByLabel('克隆主机可扩容容量至少（GB）', { exact: true }).fill('500');
     await cloneEditor.getByLabel('克隆实际额外扩容（GB）', { exact: true }).fill('100');
     await cloneEditor.getByLabel('克隆显卡驱动筛选', { exact: true }).selectOption('exact');
@@ -199,6 +202,7 @@ const { fresh } = require('../autodl-helper.user.js');
     await page.waitForFunction(() => JSON.parse(localStorage.getItem('mock-gm-autodl-helper-v1')).tasks.some(t => t.kind === 'clone'));
     const cloneSaved = await page.evaluate(() => JSON.parse(localStorage.getItem('mock-gm-autodl-helper-v1')).tasks.find(t => t.kind === 'clone'));
     assert.deepEqual(cloneSaved.targetFilters.gpus, ['RTX 4090']); assert.equal(cloneSaved.targetFilters.gpuCount, 3);
+    assert.equal(cloneSaved.targetFilters.minMemoryGb, 128);
     await advance(11000);
     await page.waitForFunction(() => JSON.parse(localStorage.getItem('mock-gm-autodl-helper-v1')).tasks.find(t => t.kind === 'clone')?.lastAction?.type === 'off');
     await advance(11000);
