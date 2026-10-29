@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoDL 抢卡助手
 // @namespace    autodl-card-helper
-// @version      0.3.3
+// @version      0.3.4
 // @homepageURL  https://github.com/Fo-OLLL/autodl-card-helper
 // @supportURL   https://github.com/Fo-OLLL/autodl-card-helper/issues
 // @updateURL    https://raw.githubusercontent.com/Fo-OLLL/autodl-card-helper/main/autodl-helper.user.js
@@ -233,14 +233,55 @@
       return this.update(s => { const task = s.tasks.find(t => t.id === id); if (task && active(task)) return fn(task, s); });
     }
     async message(id, text) { await this.patch(id, t => { t.message = text; }); }
-    async success(id, instance) {
+    async success(id, instance, completedVia) {
       await this.patch(id, (t, s) => {
         t.status = 'success'; t.instanceUuid = instance.uuid; t.message = 'GPU 开机成功'; t.completedAt = this.now();
+        if (completedVia) t.completedVia = completedVia;
         s.events.push({ id: t.id, taskName: t.name, instanceUuid: instance.uuid, createdAt: this.now(),
           desktop: false, sound: false, server: false, serverAttempts: 0, nextAt: 0 });
         s.logs.unshift({ at: this.now(), text: `${t.name}：GPU 开机成功 (${instance.uuid})` });
         s.logs = s.logs.slice(0, 100);
       });
+    }
+    async preferOriginal(task, source) {
+      if (isGpuRunning(source)) { await this.success(task.id, source, 'original'); return true; }
+      // 已发送的原实例开机请求必须先确认结果，不能并行创建克隆实例。
+      if (task.sourceStartIntent) {
+        if (source.status === 'starting') {
+          await this.patch(task.id, t => { t.sourceStartIntent.observedStarting = true; });
+        } else if (task.sourceStartIntent.observedStarting && shutdownStates.has(source.status)) {
+          await this.patch(task.id, (t, s) => { t.sourceStartIntent = null; t.sourceRetryAfter = this.now() + s.settings.intervalSeconds * 1000; });
+          return false;
+        }
+        await this.message(task.id, '原实例开机请求待确认，优先等待其结果，暂不克隆'); return true;
+      }
+      if (!(source.status === 'running' && source.start_mode === 'non_gpu') && !shutdownStates.has(source.status)) {
+        await this.message(task.id, '优先等待原实例状态变化，暂不克隆'); return true;
+      }
+      if ((task.sourceRetryAfter || 0) > this.now()) return false;
+      if (!source.machine_id || !Number.isInteger(Number(source.req_gpu_amount)) || Number(source.req_gpu_amount) < 1) {
+        await this.message(task.id, '等待确认原实例主机和卡数，暂不克隆'); return true;
+      }
+      const machine = await this.api.machineDetail(source.machine_id, task.account);
+      if (!hasEnoughGpu(machine, source.req_gpu_amount)) return false;
+      if (source.status === 'running') {
+        if (task.lastAction?.type === 'off' && this.now() - task.lastAction.at < 60000) {
+          await this.message(task.id, '原主机有卡，等待无卡实例关机后优先开机'); return true;
+        }
+        if (!await this.patch(task.id, t => { t.lastAction = { type: 'off', at: this.now() }; return true; })) return true;
+        await this.api.powerOff(source.uuid, task.account);
+        await this.message(task.id, '原主机有卡，已请求关机，接下来优先开启原实例'); return true;
+      }
+      if (!await this.patch(task.id, t => { t.sourceStartIntent = { at: this.now(), observedStarting: false }; return true; })) return true;
+      try {
+        await this.api.powerOn(source.uuid, task.account);
+        await this.message(task.id, '优先开启原实例，等待 GPU 运行；暂不克隆'); return true;
+      } catch (error) {
+        if (error.uncertain) throw error;
+        await this.patch(task.id, (t, s) => { t.sourceStartIntent = null; t.sourceRetryAfter = this.now() + s.settings.intervalSeconds * 1000; });
+        if (['AuthorizeFailed', 'AccountChanged'].includes(error.code)) throw error;
+        return false; // 明确开机失败时才尝试克隆备用路径。
+      }
     }
     async step(id) {
       let t = this.read().tasks.find(t => t.id === id);
@@ -263,6 +304,7 @@
             if (t.kind === 'clone') {
               source = rows.find(r => r.uuid === t.sourceUuid);
               if (!source) { await this.message(id, '等待源实例出现，未创建新实例'); return; }
+              if (await this.preferOriginal(t, source)) return;
               if (source.status !== 'running' && !shutdownStates.has(source.status)) {
                 await this.message(id, '等待源实例状态变化，准备克隆'); return;
               }
@@ -278,6 +320,11 @@
             }), t.config) : sortMachines(inventory, t.config);
             if (!machines.length) {
               await this.message(id, source?.status === 'running' ? '保持源实例运行，等待符合筛选的空闲 GPU 后再关机克隆' : '等待符合条件的空闲 GPU'); return;
+            }
+            // 查找克隆主机期间原主机可能刚释放 GPU，下单前再次给原实例优先权。
+            if (source) {
+              const latest = this.read().tasks.find(task => task.id === id);
+              if (!active(latest) || await this.preferOriginal(latest, source)) return;
             }
             if (source && !shutdownStates.has(source.status)) {
               if (!t.lastAction || this.now() - t.lastAction.at >= 60000) {
@@ -563,7 +610,7 @@
         el('div', {}, t.message || '等待首次检查'));
       if (t.kind === 'new') card.append(el('div', { class: 'muted' },
         `${t.config.gpus.join(' → ')} · ${t.config.gpuCount} 卡 · ${t.config.regions.map(r => r.name).join(' → ')}${t.config.minMemoryGb ? ` · 内存≥${t.config.minMemoryGb}GB` : ''}\n镜像：${t.config.image.name}`));
-      if (t.kind === 'clone') card.append(el('div', { class: 'muted' }, `克隆源：${t.sourceUuid}\n系统盘＋数据盘 · 地区固定为源实例地区 · 原实例保留\n目标：${t.targetFilters ? `${t.targetFilters.gpus.join(' → ')} · ${t.targetFilters.gpuCount} 卡${t.targetFilters.minMemoryGb ? ` · 内存≥${t.targetFilters.minMemoryGb}GB` : ''}` : '沿用原型号和卡数'}`));
+      if (t.kind === 'clone') card.append(el('div', { class: 'muted' }, `原实例优先：${t.sourceUuid}${t.completedVia === 'original' ? '（已直接开机成功，未克隆）' : ''}\n克隆备用：系统盘＋数据盘 · 地区固定为源实例地区 · 原实例保留\n目标：${t.targetFilters ? `${t.targetFilters.gpus.join(' → ')} · ${t.targetFilters.gpuCount} 卡${t.targetFilters.minMemoryGb ? ` · 内存≥${t.targetFilters.minMemoryGb}GB` : ''}` : '沿用原型号和卡数'}`));
       if (t.instanceUuid) card.append(el('div', { class: 'muted' }, `实例：${t.instanceUuid}`));
       if (active(t) && t.intent && Date.now() - t.intent.at > 120000) card.append(button('已核对未创建，重新尝试', safeAction(async () => {
         if (!window.confirm(`请先到控制台核对不存在名称为 ${t.marker} 的实例和正在创建的实例。确认后重新发送创建请求？`)) return;
@@ -618,12 +665,12 @@
     refreshCloneEditor();
   }
   const existingMode = el('select', {}, el('option', { value: 'existing' }, '原实例开机'),
-    el('option', { value: 'clone' }, '克隆为新实例并开机（含数据盘）'));
+    el('option', { value: 'clone' }, '优先原实例开机，必要时克隆（含数据盘）'));
   const clonePanel = el('div', { hidden: true });
   existingMode.addEventListener('change', () => refreshCloneEditor());
   views.existing.append(section(null, '选择已有实例', '可多选目标，每个实例都需要成功。',
     instanceList),
-    section(null, '开始抢开机', '等待空闲 GPU 时保持无卡模式运行。原实例开机：原主机卡数足够后才关机抢卡。克隆模式：检测到同地区合适目标后才关闭源实例，复制系统盘和数据盘；原实例保留。',
+    section(null, '开始抢开机', '等待空闲 GPU 时保持无卡模式运行。克隆模式同样优先监控原实例：本机能开就直接开；本机卡数不足或明确开机失败时，才使用同地区克隆备用路径。任一路径成功后任务结束。',
     label('开机方式', existingMode), clonePanel,
     button('启动所选实例抢卡', safeAction(async () => {
       if (!selectedInstances.size) throw new Error('请先选择实例');
@@ -634,7 +681,7 @@
       await update(s => { for (const r of rows) {
         if (s.tasks.some(t => t.account === account && active(t) && (t.sourceUuid || t.instanceUuid) === r.uuid)) continue;
         const id = uid(), cloning = existingMode.value === 'clone';
-        s.tasks.push({ id, kind: existingMode.value, name: `${cloning ? '克隆：' : ''}${r.name || r.uuid}`, account,
+        s.tasks.push({ id, kind: existingMode.value, name: `${cloning ? '本机优先：' : ''}${r.name || r.uuid}`, account,
           ...(cloning ? { sourceUuid: r.uuid, marker: `ADLH-${id}`, targetFilters } : { instanceUuid: r.uuid }),
           status: 'active', createdAt: Date.now(), message: cloning ? '等待克隆（含数据盘）' : '等待抢开机', nextAt: 0 });
       } });
@@ -875,7 +922,7 @@
       minExpandGb: Number(cloneMinExpand.value), expandGb: Number(cloneExpand.value), minMemoryGb: Number(cloneMemory.value) };
     validateNew({ ...c, regions: cloneRegions, image: { uuid: 'source-instance' } }); return c;
   }
-  clonePanel.append(section(null, '克隆目标筛选', '可更换显卡和卡数；源实例地区及系统盘固定，不提供地区或镜像选择。',
+  clonePanel.append(section(null, '备用克隆目标筛选', '优先按原配置开启原实例；以下条件仅用于本机无法开机时的克隆备用路径。可更换卡型和卡数，地区及系统盘固定。',
     cloneScopeHint, cloneGpuPicker.node,
     el('div', { class: 'grid' }, label('克隆 GPU 数量', cloneCount), label('克隆实例最低内存（GB，0 不限制）', cloneMemory)),
     el('p', { class: 'muted' }, '按每张 GPU 分配的内存 × 目标卡数筛选实例总内存。'), label('克隆显卡驱动筛选', cloneDriverMode),

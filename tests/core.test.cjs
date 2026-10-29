@@ -20,7 +20,7 @@ function fixture(tasks, api = {}) {
     instances: async () => [], machines: async () => [machine()],
     create: async () => 'created', clone: async () => 'cloned', snapshot: async () => sourceSnapshot(),
     regions: async () => [{ data_center: 'west', region_name: '西北', region_sign: 'west', visible: 'all', used_for: 'all' }],
-    retryClone: async () => {}, machineDetail: async () => ({ gpu_idle_num: 2, on_line: 1 }), powerOn: async () => {}, powerOff: async () => {}, init: async () => {}
+    retryClone: async () => {}, machineDetail: async () => ({ gpu_idle_num: 0, on_line: 1 }), powerOn: async () => {}, powerOff: async () => {}, init: async () => {}
   };
   const wrapped = Object.fromEntries(Object.entries({ ...defaults, ...api }).map(([name, fn]) => [name, async (...args) => {
     calls.push([name, ...copy(args)]); return fn(...args);
@@ -43,12 +43,62 @@ test('克隆请求强制复制数据盘，目标盘至少与源盘同大，源 U
   assert.equal(p.instance_info.expand_data_disk, 150 * GB); assert.equal(p.price_info.expand_data_disk, 150 * GB);
   assert.equal(p.instance_info.instance_name, 'ADLH-clone'); assert.equal(p.instance_info.keep_src_user_service_address_after_clone, false);
 });
-test('克隆先关机原实例，即使原实例 GPU 正在运行也不算成功', async () => {
+test('克隆任务的原实例 GPU 已运行时直接完成，不再克隆', async () => {
   const f = fixture([cloneTask()], { instances: async () => [{ ...sourceRow(), status: 'running', start_mode: 'gpu' }],
     machines: async () => [machine({ max_instance_disk_size: 100 * GB })] });
   await f.engine.tick();
-  assert.equal(f.calls.filter(c => c[0] === 'powerOff').length, 1);
-  assert.equal(f.calls.filter(c => c[0] === 'clone').length, 0); assert.equal(f.read().tasks[0].status, 'active');
+  assert.equal(f.calls.filter(c => c[0] === 'powerOff').length, 0);
+  assert.equal(f.calls.filter(c => c[0] === 'clone').length, 0); assert.equal(f.read().tasks[0].status, 'success');
+  assert.equal(f.read().tasks[0].completedVia, 'original');
+});
+test('本机与克隆目标均有卡时优先原实例，并等待结果防止双开', async () => {
+  let source = sourceRow();
+  const f = fixture([cloneTask()], { instances: async () => [source], machineDetail: async () => ({ gpu_idle_num: 2 }) });
+  await f.engine.tick();
+  assert.equal(f.calls.filter(c => c[0] === 'powerOn').length, 1);
+  assert.equal(f.calls.filter(c => c[0] === 'machines').length, 0);
+  f.advance(120000); await f.restart().tick();
+  assert.equal(f.calls.filter(c => c[0] === 'clone').length, 0);
+  assert.equal(f.calls.filter(c => c[0] === 'powerOn').length, 1);
+  source = { ...source, status: 'running', start_mode: 'gpu' };
+  await f.engine.tick(); assert.equal(f.read().tasks[0].status, 'success');
+  assert.equal(f.read().tasks[0].instanceUuid, 'src');
+});
+test('无卡源实例原主机有卡时优先关机再原地开机，不查克隆库存', async () => {
+  let source = { ...sourceRow(), status: 'running', start_mode: 'non_gpu' };
+  const f = fixture([cloneTask()], { instances: async () => [source], machineDetail: async () => ({ gpu_idle_num: 2 }) });
+  await f.engine.tick(); assert.equal(f.calls.filter(c => c[0] === 'powerOff').length, 1);
+  source.status = 'shutdown'; await f.engine.tick();
+  assert.equal(f.calls.filter(c => c[0] === 'powerOn').length, 1);
+  assert.equal(f.calls.filter(c => c[0] === 'machines').length, 0);
+});
+test('查克隆目标时本机刚释放卡，提交前再次优先原地开机', async () => {
+  let idle = 0;
+  const f = fixture([cloneTask()], { instances: async () => [sourceRow()], machineDetail: async () => ({ gpu_idle_num: idle }),
+    machines: async () => { idle = 2; return [machine({ max_instance_disk_size: 100 * GB })]; } });
+  await f.engine.tick(); assert.equal(f.calls.filter(c => c[0] === 'powerOn').length, 1);
+  assert.equal(f.calls.filter(c => c[0] === 'clone').length, 0);
+});
+test('原地开机明确失败才克隆，超时不确定时不能克隆', async () => {
+  for (const uncertain of [false, true]) {
+    const f = fixture([cloneTask()], { instances: async () => [sourceRow()], machineDetail: async () => ({ gpu_idle_num: 2 }),
+      machines: async () => [machine({ max_instance_disk_size: 100 * GB })],
+      powerOn: async () => { throw new ApiError('开机失败', 'GpuUnavailable', uncertain); } });
+    await f.engine.tick(); assert.equal(f.calls.filter(c => c[0] === 'clone').length, uncertain ? 0 : 1);
+    assert.equal(f.calls.filter(c => c[0] === 'powerOn').length, 1);
+    if (uncertain) { f.advance(120000); await f.restart().tick(); assert.equal(f.calls.filter(c => c[0] === 'clone').length, 0); }
+  }
+});
+test('原实例启动后再次关机才解除等待并转克隆，不重复发送开机请求', async () => {
+  let source = sourceRow();
+  const f = fixture([cloneTask()], { instances: async () => [source], machineDetail: async () => ({ gpu_idle_num: 2 }),
+    machines: async () => [machine({ max_instance_disk_size: 100 * GB })] });
+  await f.engine.tick();
+  source.status = 'starting'; await f.engine.tick();
+  assert.equal(f.read().tasks[0].sourceStartIntent.observedStarting, true);
+  source.status = 'shutdown_by_starting_error'; await f.engine.tick();
+  assert.equal(f.calls.filter(c => c[0] === 'powerOn').length, 1);
+  assert.equal(f.calls.filter(c => c[0] === 'clone').length, 1);
 });
 test('克隆可更换 GPU/卡数及筛选条件，但不能覆盖源地区和镜像', () => {
   const base = cloneSourceConfig(sourceRow(), sourceSnapshot(), [{ data_center: 'west', region_name: '西北', region_sign: 'west', visible: 'all', used_for: 'all' }]);

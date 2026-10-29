@@ -186,6 +186,7 @@ const { fresh } = require('../autodl-helper.user.js');
     await page.screenshot({ path: path.join(__dirname, '../.research/ui-settings.png') });
     assert.equal(notifications.length, 3);
     // 从抢开机页面选择克隆，源实例先关机，新实例必须等数据盘完成。
+    Object.assign(rows[0], { status: 'running', start_mode: 'non_gpu' }); originalIdle = 0;
     await page.locator('#autodl-helper-host').getByRole('button', { name: '抢开机', exact: true }).click();
     await page.clock.runFor(300);
     await page.locator('#autodl-helper-host').getByLabel(/我的无卡实例/).check();
@@ -219,6 +220,19 @@ const { fresh } = require('../autodl-helper.user.js');
     await advance(11000);
     await page.waitForFunction(() => JSON.parse(localStorage.getItem('mock-gm-autodl-helper-v1')).tasks.find(t => t.kind === 'clone')?.status === 'success');
     assert.equal(cloneCount, 1); assert.equal(notifications.length, 4);
+    // 再建一个同源复合任务：原机有卡时直接原地开机，不能再创建克隆。
+    Object.assign(rows[0], { status: 'running', start_mode: 'non_gpu' }); originalIdle = 1;
+    await page.locator('#autodl-helper-host').getByRole('button', { name: '抢开机', exact: true }).click();
+    await page.clock.runFor(300);
+    await page.locator('#autodl-helper-host').getByRole('button', { name: '启动所选实例抢卡' }).click();
+    await page.waitForFunction(() => JSON.parse(localStorage.getItem('mock-gm-autodl-helper-v1')).tasks.filter(t => t.kind === 'clone').length === 2);
+    await advance(11000);
+    await page.waitForFunction(() => JSON.parse(localStorage.getItem('mock-gm-autodl-helper-v1')).tasks.filter(t => t.kind === 'clone').at(-1)?.lastAction?.type === 'off');
+    await advance(11000);
+    await page.waitForFunction(() => JSON.parse(localStorage.getItem('mock-gm-autodl-helper-v1')).tasks.filter(t => t.kind === 'clone').at(-1)?.sourceStartIntent);
+    await advance(11000);
+    await page.waitForFunction(() => JSON.parse(localStorage.getItem('mock-gm-autodl-helper-v1')).tasks.filter(t => t.kind === 'clone').at(-1)?.completedVia === 'original');
+    assert.equal(cloneCount, 1); assert.equal(notifications.length, 5);
     // 两个页面同时接管一个尚未创建的任务，也只提交一次创建请求。
     await page.evaluate(() => {
       const key = 'mock-gm-autodl-helper-v1', s = JSON.parse(localStorage.getItem(key));
