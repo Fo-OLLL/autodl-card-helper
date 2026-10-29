@@ -15,7 +15,7 @@ const { fresh } = require('../autodl-helper.user.js');
     const errors = [], calls = [], notifications = [];
     let rows = [{ uuid: 'existing-1', name: '我的无卡实例', snapshot_gpu_alias_name: 'RTX 4090D', machine_id: 'original', region_sign: 'west1', expand_data_disk_size: 0, status: 'running', start_mode: 'non_gpu', req_gpu_amount: 1 },
       { uuid: 'shutdown-2', name: '已关机实例', snapshot_gpu_alias_name: 'A100-SXM4-80GB', status: 'shutdown', start_mode: 'gpu', req_gpu_amount: 2 }];
-    let createCount = 0, cloneCount = 0;
+    let createCount = 0, cloneCount = 0, originalIdle = 0;
     await context.exposeFunction('recordNotification', data => notifications.push(data));
     await context.addInitScript(() => {
       localStorage.setItem('token', 'mock-token');
@@ -39,6 +39,7 @@ const { fresh } = require('../autodl-helper.user.js');
         case '/api/v1/instance': data = { list: rows, result_total: rows.length, page_size: 90 }; break;
         case '/api/v1/instance/power_off': rows.find(r => r.uuid === body.instance_uuid).status = 'shutdown'; data = null; break;
         case '/api/v1/instance/power_on': Object.assign(rows.find(r => r.uuid === body.instance_uuid), { status: 'running', start_mode: 'gpu' }); data = null; break;
+        case '/api/v1/machine/detail': assert.equal(body.machine_id, 'original'); data = { gpu_idle_num: originalIdle, on_line: 1 }; break;
         case '/api/v1/instance/snapshot': data = { expand_data_disk_size: 0,
           machine_info_snapshot: { gpu_name: 'RTX 4090D', max_instance_disk_size: 100 * 1024 ** 3 },
           image: { image_type: 'public', image_name: 'base-1', chip_corp: 'nvidia', cpu_arch: 'x86', cuda_version: '12.4' } }; break;
@@ -90,6 +91,10 @@ const { fresh } = require('../autodl-helper.user.js');
     await host.getByLabel(/我的无卡实例/).check();
     await host.getByRole('button', { name: '启动所选实例抢卡' }).click();
     const advance = async n => { await page.clock.fastForward(n); await page.waitForTimeout(100); };
+    await advance(11000);
+    assert.equal(calls.filter(c => c[0].endsWith('power_off')).length, 0);
+    assert.equal(rows[0].status, 'running'); assert.equal(rows[0].start_mode, 'non_gpu');
+    originalIdle = 1;
     await advance(11000);
     await page.waitForFunction(() => JSON.parse(localStorage.getItem('mock-gm-autodl-helper-v1')).tasks[0]?.lastAction?.type === 'off');
     await advance(11000);

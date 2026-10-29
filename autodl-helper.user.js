@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoDL 抢卡助手
 // @namespace    autodl-card-helper
-// @version      0.3.2
+// @version      0.3.3
 // @homepageURL  https://github.com/Fo-OLLL/autodl-card-helper
 // @supportURL   https://github.com/Fo-OLLL/autodl-card-helper/issues
 // @updateURL    https://raw.githubusercontent.com/Fo-OLLL/autodl-card-helper/main/autodl-helper.user.js
@@ -120,6 +120,11 @@
       duration: 1, num: c.gpuCount, expand_data_disk: disk } };
   }
   function isGpuRunning(row) { return row.status === 'running' && row.start_mode === 'gpu'; }
+  function hasEnoughGpu(machine, required) {
+    const count = Number(required), idle = Number(machine?.gpu_idle_num);
+    return Number.isInteger(count) && count > 0 && Number.isFinite(idle) && idle >= count &&
+      ![3, 4, 5, 6].includes(Number(machine?.on_line));
+  }
   function cloneSourceConfig(source, snapshot, regions) {
     const machine = snapshot.machine_info_snapshot, image = snapshot.image;
     const region = groupRegions(regions).find(r => r.signs.includes(source.region_sign));
@@ -214,6 +219,7 @@
     }, account); }
     powerOn(uuid, account) { return this.call('/api/v1/instance/power_on', { instance_uuid: uuid }, account); }
     powerOff(uuid, account) { return this.call('/api/v1/instance/power_off', { instance_uuid: uuid }, account); }
+    machineDetail(machineId, account) { return this.call('/api/v1/machine/detail', { machine_id: machineId }, account); }
     create(task, m) { return this.call('/api/v1/order/instance/create/payg', createPayload(task, m), task.account); }
     clone(task, m) { return this.call('/api/v1/order/instance/clone/payg', clonePayload(task, m), task.account); }
     snapshot(uuid, account) { return this.call(`/api/v1/instance/snapshot?instance_uuid=${encodeURIComponent(uuid)}`, undefined, account); }
@@ -253,15 +259,12 @@
           } else if (t.intent) {
             await this.message(id, `创建结果待核对，持续查找实例 ${t.marker}，不会重复下单`); return;
           } else {
+            let source;
             if (t.kind === 'clone') {
-              const source = rows.find(r => r.uuid === t.sourceUuid);
+              source = rows.find(r => r.uuid === t.sourceUuid);
               if (!source) { await this.message(id, '等待源实例出现，未创建新实例'); return; }
-              if (!shutdownStates.has(source.status)) {
-                if (source.status === 'running' && (!t.lastAction || this.now() - t.lastAction.at >= 60000)) {
-                  if (!await this.patch(id, t => { t.lastAction = { type: 'off', at: this.now() }; return true; })) return;
-                  await this.api.powerOff(source.uuid, t.account);
-                }
-                await this.message(id, '克隆前等待源实例关机；系统盘和数据盘都将复制'); return;
+              if (source.status !== 'running' && !shutdownStates.has(source.status)) {
+                await this.message(id, '等待源实例状态变化，准备克隆'); return;
               }
               const config = applyCloneFilters(cloneSourceConfig(source, await this.api.snapshot(source.uuid, t.account), await this.api.regions(t.account)), t.targetFilters);
               if (!await this.patch(id, task => { task.config = config; return true; })) return;
@@ -273,7 +276,16 @@
               const c = cloneTargetConfig(t.config, m);
               return c && m.machine_id !== rows.find(r => r.uuid === t.sourceUuid)?.machine_id && matchesMachine(m, c);
             }), t.config) : sortMachines(inventory, t.config);
-            if (!machines.length) { await this.message(id, '等待符合条件的空闲 GPU'); return; }
+            if (!machines.length) {
+              await this.message(id, source?.status === 'running' ? '保持源实例运行，等待符合筛选的空闲 GPU 后再关机克隆' : '等待符合条件的空闲 GPU'); return;
+            }
+            if (source && !shutdownStates.has(source.status)) {
+              if (!t.lastAction || this.now() - t.lastAction.at >= 60000) {
+                if (!await this.patch(id, t => { t.lastAction = { type: 'off', at: this.now() }; return true; })) return;
+                await this.api.powerOff(source.uuid, t.account);
+              }
+              await this.message(id, '已发现符合条件的空闲 GPU，等待源实例关机后克隆'); return;
+            }
             const machine = machines[0];
             const prepared = await this.patch(id, t => {
               t.intent = { at: this.now(), machineId: machine.machine_id };
@@ -313,9 +325,16 @@
           if (t.lastAction?.type === 'off' && this.now() - t.lastAction.at < 60000) {
             await this.message(id, '等待无卡实例关机完成'); return;
           }
+          if (!row.machine_id || !Number.isInteger(Number(row.req_gpu_amount)) || Number(row.req_gpu_amount) < 1) {
+            await this.message(id, '保持无卡模式运行，等待确认主机和所需 GPU 数量'); return;
+          }
+          const machine = await this.api.machineDetail(row.machine_id, t.account);
+          if (!hasEnoughGpu(machine, row.req_gpu_amount)) {
+            await this.message(id, `保持无卡模式运行，等待原主机空闲 GPU 达到 ${row.req_gpu_amount} 张`); return;
+          }
           if (!await this.patch(id, t => { t.lastAction = { type: 'off', at: this.now() }; return true; })) return;
           await this.api.powerOff(row.uuid, t.account);
-          await this.message(id, '已请求关闭无卡实例，等待关机完成');
+          await this.message(id, '已检测到足够空闲 GPU，等待无卡实例关机后抢卡');
         } else if (shutdownStates.has(row.status)) {
           if (t.lastAction?.type === 'on' && this.now() - t.lastAction.at < 30000) {
             await this.message(id, '等待开机结果'); return;
@@ -364,7 +383,7 @@
   // 无需构建即可在 Node 中测试业务逻辑；浏览器执行从此处开始。
   if (typeof module === 'object' && module.exports) {
     module.exports = { Api, ApiError, Engine, fresh, compareVersion, matchesMachine, sortMachines, createPayload,
-      cloneSourceConfig, cloneTargetConfig, clonePayload, cloneDataReady, applyCloneFilters,
+      cloneSourceConfig, cloneTargetConfig, clonePayload, cloneDataReady, applyCloneFilters, hasEnoughGpu,
       groupRegions, regionalGpuOptions, availableDrivers, instanceDisplay, flattenImages, isGpuRunning, serverChanUrl, validateNew }; return;
   }
   if (window.top !== window.self || document.getElementById('autodl-helper-host')) return;
@@ -604,7 +623,7 @@
   existingMode.addEventListener('change', () => refreshCloneEditor());
   views.existing.append(section(null, '选择已有实例', '可多选目标，每个实例都需要成功。',
     instanceList),
-    section(null, '开始抢开机', '原实例开机：无卡模式会先关机。克隆模式：源实例先关机，在同地区其他主机创建按量计费实例，复制系统盘和数据盘；原实例保留。',
+    section(null, '开始抢开机', '等待空闲 GPU 时保持无卡模式运行。原实例开机：原主机卡数足够后才关机抢卡。克隆模式：检测到同地区合适目标后才关闭源实例，复制系统盘和数据盘；原实例保留。',
     label('开机方式', existingMode), clonePanel,
     button('启动所选实例抢卡', safeAction(async () => {
       if (!selectedInstances.size) throw new Error('请先选择实例');

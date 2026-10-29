@@ -3,7 +3,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { Api, ApiError, Engine, fresh, compareVersion, sortMachines, createPayload, groupRegions,
   flattenImages, regionalGpuOptions, availableDrivers, instanceDisplay, cloneSourceConfig, clonePayload, cloneDataReady, applyCloneFilters,
-  isGpuRunning, serverChanUrl, validateNew } = require('../autodl-helper.user.js');
+  isGpuRunning, hasEnoughGpu, serverChanUrl, validateNew } = require('../autodl-helper.user.js');
 const copy = x => JSON.parse(JSON.stringify(x));
 const GB = 1024 ** 3;
 const config = () => ({ gpus: ['RTX 4090D', 'RTX 4090'], regions: [{ name: '北京', signs: ['bj'] }, { name: '西北', signs: ['west'] }],
@@ -20,7 +20,7 @@ function fixture(tasks, api = {}) {
     instances: async () => [], machines: async () => [machine()],
     create: async () => 'created', clone: async () => 'cloned', snapshot: async () => sourceSnapshot(),
     regions: async () => [{ data_center: 'west', region_name: '西北', region_sign: 'west', visible: 'all', used_for: 'all' }],
-    retryClone: async () => {}, powerOn: async () => {}, powerOff: async () => {}, init: async () => {}
+    retryClone: async () => {}, machineDetail: async () => ({ gpu_idle_num: 2, on_line: 1 }), powerOn: async () => {}, powerOff: async () => {}, init: async () => {}
   };
   const wrapped = Object.fromEntries(Object.entries({ ...defaults, ...api }).map(([name, fn]) => [name, async (...args) => {
     calls.push([name, ...copy(args)]); return fn(...args);
@@ -44,7 +44,8 @@ test('克隆请求强制复制数据盘，目标盘至少与源盘同大，源 U
   assert.equal(p.instance_info.instance_name, 'ADLH-clone'); assert.equal(p.instance_info.keep_src_user_service_address_after_clone, false);
 });
 test('克隆先关机原实例，即使原实例 GPU 正在运行也不算成功', async () => {
-  const f = fixture([cloneTask()], { instances: async () => [{ ...sourceRow(), status: 'running', start_mode: 'gpu' }] });
+  const f = fixture([cloneTask()], { instances: async () => [{ ...sourceRow(), status: 'running', start_mode: 'gpu' }],
+    machines: async () => [machine({ max_instance_disk_size: 100 * GB })] });
   await f.engine.tick();
   assert.equal(f.calls.filter(c => c[0] === 'powerOff').length, 1);
   assert.equal(f.calls.filter(c => c[0] === 'clone').length, 0); assert.equal(f.read().tasks[0].status, 'active');
@@ -198,9 +199,12 @@ test('已选择多个实例全部完成，单个成功不终止其他任务', as
   assert.equal(f.calls.filter(c => c[0] === 'powerOn').length, 1);
   await f.engine.tick(); assert.equal(f.read().events.length, 1);
 });
-test('无卡模式先关机，等待关机完成才 GPU 开机，最终才算成功', async () => {
-  let row = { uuid: 'a', status: 'running', start_mode: 'non_gpu' };
-  const f = fixture([existing('a')], { instances: async () => [row] });
+test('无卡模式保持运行，足够卡数时才关机并等待 GPU 开机成功', async () => {
+  let row = { uuid: 'a', machine_id: 'original', req_gpu_amount: 2, status: 'running', start_mode: 'non_gpu' }, idle = 0;
+  const f = fixture([existing('a')], { instances: async () => [row], machineDetail: async () => ({ gpu_idle_num: idle, on_line: 1 }) });
+  await f.engine.tick(); assert.equal(f.calls.filter(c => c[0] === 'powerOff').length, 0);
+  idle = 1; await f.restart().tick(); assert.equal(f.calls.filter(c => c[0] === 'powerOff').length, 0);
+  idle = 2;
   await f.engine.tick(); assert.equal(f.calls.filter(c => c[0] === 'powerOff').length, 1);
   await f.engine.tick(); assert.equal(f.calls.filter(c => c[0] === 'powerOff').length, 1);
   assert.equal(f.calls.filter(c => c[0] === 'powerOn').length, 0);
@@ -210,6 +214,32 @@ test('无卡模式先关机，等待关机完成才 GPU 开机，最终才算成
   assert.equal(f.read().tasks[0].status, 'active');
   row = { ...row, status: 'running', start_mode: 'gpu' }; await f.engine.tick();
   assert.equal(f.read().tasks[0].status, 'success');
+});
+test('无法确认库存、维护中、卡数不足时不能关机', () => {
+  assert.equal(hasEnoughGpu({}, 1), false);
+  assert.equal(hasEnoughGpu({ gpu_idle_num: 1 }, 2), false);
+  assert.equal(hasEnoughGpu({ gpu_idle_num: 4, on_line: 3 }, 2), false);
+  assert.equal(hasEnoughGpu({ gpu_idle_num: 4 }, undefined), false);
+  assert.equal(hasEnoughGpu({ gpu_idle_num: 2, on_line: 1 }, 2), true);
+});
+test('库存查询失败及查询期间取消任务都不关闭无卡实例', async () => {
+  const row = { uuid: 'a', machine_id: 'original', req_gpu_amount: 1, status: 'running', start_mode: 'non_gpu' };
+  const failed = fixture([existing('a')], { instances: async () => [row], machineDetail: async () => { throw new ApiError('网络异常'); } });
+  await failed.engine.tick(); assert.equal(failed.calls.filter(c => c[0] === 'powerOff').length, 0);
+  const cancelled = fixture([existing('a')], { instances: async () => [row], machineDetail: async () => {
+    await cancelled.update(s => { s.tasks[0].status = 'cancelled'; }); return { gpu_idle_num: 1 };
+  } });
+  await cancelled.engine.tick(); assert.equal(cancelled.calls.filter(c => c[0] === 'powerOff').length, 0);
+});
+test('克隆等待合适库存期间保留无卡运行，目标满足条件后才关机', async () => {
+  let inventory = [];
+  const f = fixture([cloneTask()], { instances: async () => [{ ...sourceRow(), status: 'running', start_mode: 'non_gpu' }], machines: async () => inventory });
+  await f.engine.tick(); assert.equal(f.calls.filter(c => c[0] === 'powerOff').length, 0);
+  inventory = [machine({ gpu_idle_num: 1, max_instance_disk_size: 100 * GB })];
+  await f.engine.tick(); assert.equal(f.calls.filter(c => c[0] === 'powerOff').length, 0);
+  inventory[0].gpu_idle_num = 2;
+  await f.engine.tick(); assert.equal(f.calls.filter(c => c[0] === 'powerOff').length, 1);
+  assert.equal(f.calls.filter(c => c[0] === 'clone').length, 0);
 });
 test('未知开机模式和 starting 状态都不能冒报成功', () => {
   assert.equal(isGpuRunning({ status: 'running' }), false);
