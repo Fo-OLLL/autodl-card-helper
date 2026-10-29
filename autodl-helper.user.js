@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoDL 抢卡助手
 // @namespace    autodl-card-helper
-// @version      0.3.4
+// @version      0.3.5
 // @homepageURL  https://github.com/Fo-OLLL/autodl-card-helper
 // @supportURL   https://github.com/Fo-OLLL/autodl-card-helper/issues
 // @updateURL    https://raw.githubusercontent.com/Fo-OLLL/autodl-card-helper/main/autodl-helper.user.js
@@ -519,7 +519,7 @@
         await update(s => { s.nextCycleAt = Date.now() + s.settings.intervalSeconds * 1000; });
       });
     } catch (error) { notice(error.message); }
-    finally { busy = false; loopTimer = setTimeout(loop, Math.max(5, Number(read().settings.intervalSeconds) || 10) * 1000); }
+    finally { busy = false; loopTimer = setTimeout(loop, Math.max(1, Number(read().settings.intervalSeconds) || 10) * 1000); }
   }
 
   const host = document.createElement('div'); host.id = 'autodl-helper-host';
@@ -932,19 +932,19 @@
   updateCloneDriverMode();
 
   const settings = read().settings;
-  const interval = input('number', settings.intervalSeconds, { min: 5, step: 1 });
+  const interval = input('number', settings.intervalSeconds, { min: 1, step: 1 });
   const sound = input('checkbox', '', { checked: settings.sound });
   const desktop = input('checkbox', '', { checked: settings.desktop });
   const server = input('checkbox', '', { checked: settings.serverChan });
   const sendKey = input('password', settings.sendKey, { placeholder: '可选，填写 Server酱 SendKey', autocomplete: 'off' });
-  views.settings.append(section(null, '监控频率', '所有任务共用一个检查间隔。', label('全局检查间隔（秒，最小 5，默认 10）', interval)),
+  views.settings.append(section(null, '监控频率', '所有任务共用一个检查间隔。', label('全局检查间隔（秒，最小 1，默认 10）', interval)),
     section(null, '本地提醒', '首次点击“测试提醒”解锁声音；浏览器可能限制后台定时器和声音。',
       el('label', { class: 'check' }, sound, '提示音'), el('label', { class: 'check' }, desktop, '浏览器桌面通知')),
     section(null, '微信通知 · 可选', 'SendKey 只保存在本机油猴存储中。请到 Server酱后台绑定微信推送渠道。',
       el('label', { class: 'check' }, server, '启用 Server酱微信通知（可选）'), label('Server酱 SendKey', sendKey)),
     el('div', { class: 'bar' },
     button('保存设置', safeAction(async () => {
-      const n = Number(interval.value); if (!Number.isInteger(n) || n < 5) throw new Error('检查间隔应为至少 5 秒的整数');
+      const n = Number(interval.value); if (!Number.isInteger(n) || n < 1) throw new Error('检查间隔应为至少 1 秒的整数');
       if (server.checked) serverChanUrl(sendKey.value.trim());
       await update(s => { s.settings = { intervalSeconds: n, sound: sound.checked, desktop: desktop.checked,
         serverChan: server.checked, sendKey: sendKey.value.trim() }; }); notice('设置已保存');
